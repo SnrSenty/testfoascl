@@ -8,7 +8,7 @@ app = FastAPI()
 async def handle_donation(request: Request):
     data = await request.json()
 
-    # Сообщение с доната, сюда человек вводит: premium:123456789
+    # В DonationAlerts вебхуке поле message содержит текст, например: premium:123456789
     message = data.get("message", "").lower()
     logging.info(f"Донат получен: {message}")
 
@@ -29,3 +29,8 @@ async def handle_donation(request: Request):
             return {"status": "error", "reason": str(e)}
 
     return {"status": "ignored"}
+
+# --- КАК НАСТРОИТЬ ВЕБХУК ---
+# 1. Этот сервер должен быть доступен из интернета (например, через хостинг, либо через ngrok для теста).
+# 2. В настройках DonationAlerts указываешь URL вебхука, например: https://твой_домен/donate
+# 3. После успешной оплаты DonationAlerts будет делать POST запросы сюда.

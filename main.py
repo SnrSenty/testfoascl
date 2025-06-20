@@ -30,8 +30,8 @@ PREMIUM_PLUS_DAYS = 30
 PREMIUM_PLUS_TOKENS = 500
 
 # DonationAlerts 
-DONATIONALERTS_PREMIUM_LINK = "https://www.donationalerts.com/r/yourpremiumlink"
-DONATIONALERTS_PREMIUM_PLUS_LINK = "https://www.donationalerts.com/r/yourpremiumpluslink"
+DONATIONALERTS_PREMIUM_LINK = ""
+DONATIONALERTS_PREMIUM_PLUS_LINK = ""
 
 AI_MODELS = {
     "chatgpt_4_1_nano": {
@@ -261,6 +261,37 @@ def update_user_data(user_id, data):
         data.get("last_message_time", 0),
         data["last_active_date"].strftime("%Y-%m-%d"),
     ), commit=True)
+
+def update_user_subscription(user_id, subscription_type):
+    # subscription_type: "premium" или "premium_plus"
+    import datetime
+    user_data = get_user_data(user_id) or {
+        "tokens": 0,
+        "words": 0,
+        "premium": False,
+        "premium_plus": False,
+        "expires_at": None,
+        "last_reset": datetime.datetime.now(),
+        "model": "chatgpt_4_1_nano",
+        "ref_count": 0,
+        "last_message_time": 0,
+        "last_active_date": datetime.datetime.now(),
+    }
+    now = datetime.datetime.now()
+    days = 30  # на сколько дней выдаётся премиум, можешь поменять
+
+    if subscription_type == "premium":
+        user_data["premium"] = True
+        user_data["premium_plus"] = False
+        user_data["expires_at"] = now + datetime.timedelta(days=days)
+    elif subscription_type == "premium_plus":
+        user_data["premium"] = True
+        user_data["premium_plus"] = True
+        user_data["expires_at"] = now + datetime.timedelta(days=days)
+    else:
+        raise ValueError("Неизвестный тип подписки")
+
+    update_user_data(user_id, user_data)
 
 def get_or_create_referral_code(user_id):
     code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)

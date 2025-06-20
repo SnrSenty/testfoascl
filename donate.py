@@ -1,8 +1,12 @@
+# Этот файл теперь можно не использовать, если переходишь полностью на вебхуки.
+# Если хочешь оставить мониторинг через API DonationAlerts — можешь использовать оба подхода.
+# ВАЖНО: ACCESS_TOKEN надо получить по OAuth через DonationAlerts (см. aboba.py).
+
 import requests
 import time
 from main import update_user_subscription
 
-ACCESS_TOKEN = "сюда_вставь_твой_access_token"
+ACCESS_TOKEN = "сюда_вставь_твой_access_token"  # Получи токен через OAuth
 
 # Для хранения последних ID, чтобы не обрабатывать повторно
 seen_donations = set()
