@@ -26,12 +26,11 @@ BOT_TOKEN = "7920009590:AAFG6T5NHqron96oyUSST_nXJhsqz3J4TeE"
 ADMIN_ID_LIST = [5191720312, 7960796663]
 DB_FILE = "users.db"
 PREMIUM_DAYS = 30
-PREMIUM_PLUS_DAYS = 30  
+PREMIUM_PLUS_DAYS = 30
 PREMIUM_PLUS_TOKENS = 500
 
-# DonationAlerts 
-DONATIONALERTS_PREMIUM_LINK = ""
-DONATIONALERTS_PREMIUM_PLUS_LINK = ""
+DONATIONALERTS_PREMIUM_LINK = "https://www.donationalerts.com/test/premium"
+DONATIONALERTS_PREMIUM_PLUS_LINK = "https://www.donationalerts.com/test/premium-plus"
 
 AI_MODELS = {
     "chatgpt_4_1_nano": {
@@ -262,36 +261,41 @@ def update_user_data(user_id, data):
         data["last_active_date"].strftime("%Y-%m-%d"),
     ), commit=True)
 
-def update_user_subscription(user_id, subscription_type):
-    # subscription_type: "premium" или "premium_plus"
-    import datetime
-    user_data = get_user_data(user_id) or {
-        "tokens": 0,
+def update_user_subscription(user_id: int, subscription_type: str, context=None):
+    now = datetime.datetime.now()
+    expires = now + datetime.timedelta(days=PREMIUM_PLUS_DAYS if subscription_type == "premium_plus" else PREMIUM_DAYS)
+    data = get_user_data(user_id) or {
+        "tokens": LIMITS["premium_plus" if subscription_type == "premium_plus" else "premium"]["tokens"],
         "words": 0,
         "premium": False,
         "premium_plus": False,
-        "expires_at": None,
-        "last_reset": datetime.datetime.now(),
+        "last_reset": now,
         "model": "chatgpt_4_1_nano",
         "ref_count": 0,
         "last_message_time": 0,
-        "last_active_date": datetime.datetime.now(),
+        "last_active_date": now,
     }
-    now = datetime.datetime.now()
-    days = 30  # на сколько дней выдаётся премиум, можешь поменять
-
-    if subscription_type == "premium":
-        user_data["premium"] = True
-        user_data["premium_plus"] = False
-        user_data["expires_at"] = now + datetime.timedelta(days=days)
-    elif subscription_type == "premium_plus":
-        user_data["premium"] = True
-        user_data["premium_plus"] = True
-        user_data["expires_at"] = now + datetime.timedelta(days=days)
+    if subscription_type == "premium_plus":
+        data["premium"] = True
+        data["premium_plus"] = True
+        data["expires_at"] = expires
+        data["tokens"] = LIMITS["premium_plus"]["tokens"]
     else:
-        raise ValueError("Неизвестный тип подписки")
-
-    update_user_data(user_id, user_data)
+        data["premium"] = True
+        data["premium_plus"] = False
+        data["expires_at"] = expires
+        data["tokens"] = LIMITS["premium"]["tokens"]
+    update_user_data(user_id, data)
+    if context:
+        try:
+            msg = (
+                f"✅ Ваша подписка <b>{'Premium+' if subscription_type=='premium_plus' else 'Premium'}</b> активирована!\n\n"
+                f"Теперь ваши лимиты увеличены: {data['tokens']} токенов ежедневно, расширенные бонусы и приоритетный доступ к ИИ.\n"
+                "Спасибо за поддержку и приятного использования! 🎉"
+            )
+            context.bot.send_message(user_id, msg, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке уведомления об активации премиума: {e}")
 
 def get_or_create_referral_code(user_id):
     code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
@@ -386,10 +390,11 @@ def get_model_buttons(selected_model=None):
     img_buttons = []
     for key, model in AI_MODELS.items():
         btn_text = f"{'✅ ' if key == selected_model else ''}{model['title']} — {model['price']} ток."
+        btn = InlineKeyboardButton(btn_text, callback_data=f"choose_model_{key}")
         if model["type"] == "text":
-            text_buttons.append([InlineKeyboardButton(btn_text, callback_data=f"choose_model_{key}")])
+            text_buttons.append([btn])
         elif model["type"] == "image":
-            img_buttons.append([InlineKeyboardButton(btn_text, callback_data=f"choose_model_{key}")])
+            img_buttons.append([btn])
     return text_buttons, img_buttons
 
 def get_settings_menu():
@@ -400,6 +405,26 @@ def get_settings_menu():
         [InlineKeyboardButton("🔙 Назад к профилю", callback_data="back_to_profile")]
     ]
 
+def get_premium_message_and_keyboard():
+    text = (
+        "💎 <b>Покупка Premium или Premium+</b> 💎\n\n"
+        "1️⃣ Выберите вид подписки и нажмите кнопку оплаты через DonationAlerts\n"
+        "2️⃣ Оплатите выбранную подписку\n\n"
+        "<b>Преимущества подписок:</b>\n"
+        "• <b>Premium:</b> 300 токенов каждый день, увеличенные бонусы за друзей и задания, приоритетный доступ\n"
+        "• <b>Premium+:</b> 500 токенов каждый день, максимальные бонусы и эксклюзивные возможности\n\n"
+        "После оплаты Premium или Premium+ ваш аккаунт будет активирован автоматически.\n"
+        "Если возникнут вопросы или проблемы — пишите в техподдержку: @ggselton 📩"
+    )
+    kb = [
+        [
+            InlineKeyboardButton("💎 Купить Premium (месяц)", url=DONATIONALERTS_PREMIUM_LINK)
+        ],
+        [
+            InlineKeyboardButton("👑 Купить Premium+ (месяц)", url=DONATIONALERTS_PREMIUM_PLUS_LINK)
+        ]
+    ]
+    return text, InlineKeyboardMarkup(kb)
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -427,7 +452,9 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ <i>Токены обновляются раз в 24 часа. Используйте их для общения с ИИ и генерации изображений. "
         "Премиум даёт больше токенов и бонусов!</i>\n"
     )
-    reply_keyboard = [["👤 Профиль", "⚙️Настройки"]]
+    reply_keyboard = [
+        ["👤 Профиль", "⚙️Настройки", "💎 Купить режим"]
+    ]
     reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     kb = [
         [InlineKeyboardButton("💎 Купить Premium", callback_data="buy_premium_info")]
@@ -440,7 +467,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(
         user_id,
-        "Хотите больше возможностей? Получите Premium 👑 и получите больше токенов, бонусов и приоритетный доступ!",
+        "Хотите больше возможностей?\n"
+        "Получите Premium 👑 и получите больше токенов, бонусов и приоритетный доступ!",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
@@ -475,7 +503,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "last_active_date": now,
         }
         update_user_data(user_id, user)
-    reply_keyboard = [["👤 Профиль", "⚙️Настройки"]]
+    reply_keyboard = [
+        ["👤 Профиль", "⚙️Настройки", "💎 Купить режим"]
+    ]
     reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     subscribed = await check_subscription(user_id, context)
     if subscribed:
@@ -528,27 +558,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await profile(update, context)
 
     elif query.data == "buy_premium_info":
-        text = (
-            "💎 <b>Покупка Premium или Premium+</b> 💎\n\n"
-            "1️⃣ Выберите вид подписки и нажмите кнопку оплаты через DonationAlerts\n"
-            "2️⃣ Оплатите выбранную подписку\n\n"
-            "<b>Преимущества подписок:</b>\n"
-            "• <b>Premium:</b> 300 токенов каждый день, увеличенные бонусы за друзей и задания, приоритетный доступ\n"
-            "• <b>Premium+:</b> 500 токенов каждый день, максимальные бонусы и эксклюзивные возможности\n\n"
-            "После оплаты Premium или Premium+ ваш аккаунт будет активирован автоматически (через API/вебхук).\n"
-            "Если возникнут вопросы или проблемы — пишите в техподдержку: @ggselton 📩"
-        )
-        kb = [
-            [
-                InlineKeyboardButton("💎 Купить Premium (месяц)", url=DONATIONALERTS_PREMIUM_LINK)
-            ],
-            [
-                InlineKeyboardButton("👑 Купить Premium+ (месяц)", url=DONATIONALERTS_PREMIUM_PLUS_LINK)
-            ]
-        ]
+        text, kb = get_premium_message_and_keyboard()
         await query.message.reply_text(
             text,
-            reply_markup=InlineKeyboardMarkup(kb),
+            reply_markup=kb,
             parse_mode="HTML"
         )
 
@@ -641,7 +654,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quest_channels = get_quest_channels()
         kb = []
         for ch_url, bonus in quest_channels:
-            kb.append([InlineKeyboardButton("Подписаться", url=ch_url), InlineKeyboardButton("Проверить", callback_data=f"quest_check_{ch_url}")])
+            kb.append([
+                InlineKeyboardButton(f"Подписаться ({bonus} ток.)", url=ch_url),
+                InlineKeyboardButton("Проверить", callback_data=f"quest_check_{ch_url}")
+            ])
         kb.append([InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")])
         await context.bot.send_message(
             user_id,
@@ -779,6 +795,14 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "— Управляйте своим профилем, выбирайте модели, открывайте бонусы и задания.\n"
             "— Премиум-аккаунт расширяет ваши возможности!",
             reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+    elif text == "💎 Купить режим":
+        msg, kb = get_premium_message_and_keyboard()
+        await context.bot.send_message(
+            update.effective_user.id,
+            msg,
+            reply_markup=kb,
             parse_mode="HTML"
         )
 
@@ -972,41 +996,8 @@ async def daily_token_reset(context: ContextTypes.DEFAULT_TYPE):
         data["last_reset"] = now
         update_user_data(user_id, data)
 
-# --- DonationAlerts Webhook Handler ---
 async def donationalerts_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Этот хендлер должен вызываться через отдельный webhook endpoint вне Telegram
-    # Пример интеграции с Flask/FastAPI: в этой функции логика активации премиума по payment_id и user_id
-    # Ниже пример работы с Telegram user_id, subscription_type ("premium" или "premium_plus")
-    # ВАЖНО: Вызывать update_user_subscription(user_id, subscription_type) по факту успешной оплаты!
-    pass  # Имплементация на стороне вашего веб-приложения (Flask/FastAPI)
-
-def update_user_subscription(user_id: int, subscription_type: str):
-    now = datetime.datetime.now()
-    expires = now + datetime.timedelta(days=PREMIUM_PLUS_DAYS if subscription_type == "premium_plus" else PREMIUM_DAYS)
-    data = get_user_data(user_id) or {
-        "tokens": LIMITS["premium_plus" if subscription_type == "premium_plus" else "premium"]["tokens"],
-        "words": 0,
-        "premium": False,
-        "premium_plus": False,
-        "last_reset": now,
-        "model": "chatgpt_4_1_nano",
-        "ref_count": 0,
-        "last_message_time": 0,
-        "last_active_date": now,
-    }
-    if subscription_type == "premium_plus":
-        data["premium"] = True
-        data["premium_plus"] = True
-        data["expires_at"] = expires
-        data["tokens"] = LIMITS["premium_plus"]["tokens"]
-    else:
-        data["premium"] = True
-        data["premium_plus"] = False
-        data["expires_at"] = expires
-        data["tokens"] = LIMITS["premium"]["tokens"]
-    update_user_data(user_id, data)
-    # Можно добавить уведомление пользователю через Telegram бот:
-    # context.bot.send_message(user_id, f"✅ {subscription_type.capitalize()} активирован на месяц! Спасибо за оплату.")
+    pass
 
 def main():
     init_db()
@@ -1022,7 +1013,7 @@ def main():
     application.add_handler(CommandHandler("adc", adc))
     application.add_handler(CommandHandler("adcdelete", adcdelete))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.Regex(r"^👤 Профиль$") | filters.Regex(r"^⚙️Настройки$"), keyboard_handler))
+    application.add_handler(MessageHandler(filters.Regex(r"^👤 Профиль$") | filters.Regex(r"^⚙️Настройки$") | filters.Regex(r"^💎 Купить режим$"), keyboard_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), ai_message_handler))
     application.add_error_handler(error_handler)
     job_queue = application.job_queue
