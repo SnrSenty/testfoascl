@@ -9,6 +9,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,6 +32,8 @@ PREMIUM_PLUS_TOKENS = 500
 
 DONATIONALERTS_PREMIUM_LINK = "https://www.donationalerts.com/test/premium"
 DONATIONALERTS_PREMIUM_PLUS_LINK = "https://www.donationalerts.com/test/premium-plus"
+CRYPTOBOT_PREMIUM_LINK = "https://t.me/CryptoBot?start=example-premium"
+CRYPTOBOT_PREMIUM_PLUS_LINK = "https://t.me/CryptoBot?start=example-premiumplus"
 
 AI_MODELS = {
     "chatgpt_4_1_nano": {
@@ -69,8 +72,8 @@ AI_MODELS = {
         "title": "Deepseek v3",
         "price": 25,
         "type": "text",
-        "api_url": "",
-        "api_key": "",
+        "api_url": "deepseek/deepseek-chat-v3-0324:free",
+        "api_key": "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",
         "model_id": "deepseek-chat-v3"
     },
     "deepseek_r1": {
@@ -92,9 +95,9 @@ AI_MODELS = {
 }
 
 LIMITS = {
-    "free": {"tokens": 100, "word_limit": 70, "ref_bonus": 25},
-    "premium": {"tokens": 300, "word_limit": 70, "ref_bonus": 50},
-    "premium_plus": {"tokens": PREMIUM_PLUS_TOKENS, "word_limit": 70, "ref_bonus": 75}
+    "free": {"tokens": 100, "word_limit": 70, "ref_bonus": 25, "image_per_day": 0},
+    "premium": {"tokens": 300, "word_limit": 70, "ref_bonus": 50, "image_per_day": 1},
+    "premium_plus": {"tokens": PREMIUM_PLUS_TOKENS, "word_limit": 70, "ref_bonus": 75, "image_per_day": 1}
 }
 
 logging.basicConfig(
@@ -133,7 +136,8 @@ def init_db():
             referred_by INTEGER,
             ref_count INTEGER DEFAULT 0,
             last_message_time INTEGER DEFAULT 0,
-            last_active_date TEXT
+            last_active_date TEXT,
+            last_image_gen_date TEXT DEFAULT NULL
         )
     """, commit=True)
     execute_db("""
@@ -180,6 +184,10 @@ def init_db():
     execute_db("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ads_post_url ON ads(post_url)
     """, commit=True)
+    columns = execute_db("PRAGMA table_info(users)", fetchone=False)
+    colnames = [c[1] for c in columns]
+    if "last_image_gen_date" not in colnames:
+        execute_db("ALTER TABLE users ADD COLUMN last_image_gen_date TEXT DEFAULT NULL", commit=True)
 
 def migrate_db():
     columns = execute_db("PRAGMA table_info(users)", fetchone=False)
@@ -197,6 +205,8 @@ def migrate_db():
         alter_stmts.append("ALTER TABLE users ADD COLUMN last_message_time INTEGER DEFAULT 0")
     if "last_active_date" not in colnames:
         alter_stmts.append("ALTER TABLE users ADD COLUMN last_active_date TEXT")
+    if "last_image_gen_date" not in colnames:
+        alter_stmts.append("ALTER TABLE users ADD COLUMN last_image_gen_date TEXT DEFAULT NULL")
     for stmt in alter_stmts:
         try:
             execute_db(stmt, commit=True)
@@ -239,13 +249,16 @@ def get_user_data(user_id):
             "ref_count": row[9] or 0,
             "last_message_time": row[10] or 0,
             "last_active_date": datetime.datetime.strptime(row[11], "%Y-%m-%d") if row[11] else datetime.datetime.now(),
+            "last_image_gen_date": (
+                datetime.datetime.strptime(row[12], "%Y-%m-%d") if row[12] else None
+            ),
         }
     return None
 
 def update_user_data(user_id, data):
     execute_db("""
-        INSERT OR REPLACE INTO users (user_id, tokens, words, premium, premium_plus, expires_at, last_reset, model, referred_by, ref_count, last_message_time, last_active_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO users (user_id, tokens, words, premium, premium_plus, expires_at, last_reset, model, referred_by, ref_count, last_message_time, last_active_date, last_image_gen_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         data.get("tokens", 0),
@@ -259,6 +272,7 @@ def update_user_data(user_id, data):
         data.get("ref_count", 0),
         data.get("last_message_time", 0),
         data["last_active_date"].strftime("%Y-%m-%d"),
+        data["last_image_gen_date"].strftime("%Y-%m-%d") if data.get("last_image_gen_date") else None,
     ), commit=True)
 
 def update_user_subscription(user_id: int, subscription_type: str, context=None):
@@ -274,6 +288,7 @@ def update_user_subscription(user_id: int, subscription_type: str, context=None)
         "ref_count": 0,
         "last_message_time": 0,
         "last_active_date": now,
+        "last_image_gen_date": None,
     }
     if subscription_type == "premium_plus":
         data["premium"] = True
@@ -319,7 +334,7 @@ def is_admin(user_id):
 
 def give_premium_to_admins():
     now = datetime.datetime.now()
-    expires = now + datetime.timedelta(days=PREMIUM_PLUS_DAYS)
+    expires = now + datetime.timedelta(days=365)
     for admin_id in ADMIN_ID_LIST:
         data = get_user_data(admin_id) or {
             "tokens": LIMITS['premium_plus']['tokens'],
@@ -331,6 +346,7 @@ def give_premium_to_admins():
             "ref_count": 0,
             "last_message_time": 0,
             "last_active_date": now,
+            "last_image_gen_date": None,
         }
         data["premium"] = True
         data["premium_plus"] = True
@@ -402,29 +418,196 @@ def get_settings_menu():
         [InlineKeyboardButton("🤖 Генерация текста", callback_data="choose_text_model_menu")],
         [InlineKeyboardButton("🖼️ Генерация изображений", callback_data="choose_image_model_menu")],
         [InlineKeyboardButton("🎁 Бонусы и задания", callback_data="bonuses_info")],
+        [InlineKeyboardButton("🏆 Достижения", callback_data="achievements_menu")], 
         [InlineKeyboardButton("🔙 Назад к профилю", callback_data="back_to_profile")]
     ]
 
-def get_premium_message_and_keyboard():
-    text = (
-        "💎 <b>Покупка Premium или Premium+</b> 💎\n\n"
-        "1️⃣ Выберите вид подписки и нажмите кнопку оплаты через DonationAlerts\n"
-        "2️⃣ Оплатите выбранную подписку\n\n"
-        "<b>Преимущества подписок:</b>\n"
-        "• <b>Premium:</b> 300 токенов каждый день, увеличенные бонусы за друзей и задания, приоритетный доступ\n"
-        "• <b>Premium+:</b> 500 токенов каждый день, максимальные бонусы и эксклюзивные возможности\n\n"
-        "После оплаты Premium или Premium+ ваш аккаунт будет активирован автоматически.\n"
-        "Если возникнут вопросы или проблемы — пишите в техподдержку: @ggselton 📩"
-    )
-    kb = [
+# --- PREMIUM MESSAGE & PAYMENT LOGIC ---
+
+def get_premium_payment_keyboard(payment_method="donationalerts"):
+    # payment_method: "donationalerts" or "cryptobot"
+    is_donationalerts = payment_method == "donationalerts"
+    select_buttons = [
+        InlineKeyboardButton(
+            "DonationAlerts" + (" ✅" if is_donationalerts else ""),
+            callback_data="buy_premium_select_donationalerts"
+        ),
+        InlineKeyboardButton(
+            "CryptoBot" + (" ✅" if not is_donationalerts else ""),
+            callback_data="buy_premium_select_cryptobot"
+        )
+    ]
+    if is_donationalerts:
+        premium_url = DONATIONALERTS_PREMIUM_LINK
+        premium_plus_url = DONATIONALERTS_PREMIUM_PLUS_LINK
+    else:
+        premium_url = CRYPTOBOT_PREMIUM_LINK
+        premium_plus_url = CRYPTOBOT_PREMIUM_PLUS_LINK
+    buttons = [
+        select_buttons,
         [
-            InlineKeyboardButton("💎 Купить Premium (месяц)", url=DONATIONALERTS_PREMIUM_LINK)
+            InlineKeyboardButton("💎 Купить Premium (месяц)", url=premium_url)
         ],
         [
-            InlineKeyboardButton("👑 Купить Premium+ (месяц)", url=DONATIONALERTS_PREMIUM_PLUS_LINK)
+            InlineKeyboardButton("👑 Купить Premium+ (месяц)", url=premium_plus_url)
         ]
     ]
-    return text, InlineKeyboardMarkup(kb)
+    return InlineKeyboardMarkup(buttons)
+
+def get_premium_message():
+    text = (
+        "💎 <b>Покупка Premium или Premium+</b> 💎\n\n"
+        "1️⃣ Выберите способ оплаты и вид подписки\n"
+        "2️⃣ Оплатите выбранную подписку через DonationAlerts или CryptoBot\n\n"
+        "<b>Преимущества:</b>\n"
+        "• <b>Premium:</b> 300 токенов ежедневно, увеличенные бонусы за друзей и задания, приоритетный доступ\n"
+        "• <b>Premium+:</b> 500 токенов ежедневно, максимальные бонусы и эксклюзивные возможности\n\n"
+        "<i>После оплаты подписка активируется автоматически.</i>\n"
+        "<i>Если возникнут вопросы или проблемы — пишите в техподдержку: @ggselton 📩</i>"
+    )
+    return text
+
+def get_referrals_info(user_id):
+    # Получаем список рефералов этого пользователя и info о заработке
+    ref_info = execute_db(
+        """
+        SELECT u.user_id, u.tokens, r.joined_at
+        FROM users u
+        JOIN referrals r ON u.user_id = r.user_id
+        WHERE u.referred_by = ?
+        ORDER BY r.joined_at DESC
+        """,
+        (user_id,),
+        fetchone=False,
+    )
+    total_referrals = len(ref_info)
+    user_data = get_user_data(user_id)
+    if not user_data:
+        total_earned = 0
+        ref_bonus = 0
+    else:
+        limit_type = "premium_plus" if user_data.get("premium_plus") else "premium" if user_data.get("premium") else "free"
+        ref_bonus = LIMITS[limit_type]["ref_bonus"]
+        total_earned = total_referrals * ref_bonus
+
+    lines = []
+    for idx, (uid, _, joined_at) in enumerate(ref_info, start=1):
+        # Имя пользователя
+        cur = execute_db("SELECT username FROM users WHERE user_id = ?", (uid,), fetchone=True)
+        if cur and cur[0]:
+            uname = f"@{cur[0]}"
+        else:
+            uname = f"ID {uid}"
+        # Когда присоединился
+        date_str = joined_at if joined_at else "-"
+        try:
+            date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+            date_str = date_obj.strftime("%d.%m.%Y")
+        except (ValueError, TypeError):
+            pass
+        lines.append(f"{idx}. {uname} — <b>{ref_bonus}</b> токенов (<i>{date_str}</i>)")
+
+    header = (
+        f"👥 <b>Ваши приглашённые друзья</b>\n"
+        f"• <b>Всего приглашено:</b> <b>{total_referrals}</b>\n"
+        f"• <b>Всего заработано:</b> <b>{total_earned}</b> токенов\n"
+        f"• <b>Бонус за каждого:</b> <b>{ref_bonus}</b> токенов\n\n"
+    )
+    if not lines:
+        body = "<i>Вы ещё не пригласили ни одного друга через свою ссылку.</i>"
+    else:
+        body = "\n".join(lines)
+    return header + body
+
+# --- ACHIEVEMENTS SYSTEM ---
+
+ACHIEVEMENTS = [
+    # (id, title, description, condition_fn, reward_tokens, progress_fn)
+    ("spend_100", "Потратить 100 токенов", "Потратьте 100 токенов",
+     lambda u: u["words"] >= 100, 0, lambda u: (min(u["words"], 100), 100)),
+    ("spend_300", "Потратить 300 токенов", "Потратьте 300 токенов",
+     lambda u: u["words"] >= 300, 0, lambda u: (min(u["words"], 300), 300)),
+    ("spend_500", "Потратить 500 токенов", "Потратьте 500 токенов",
+     lambda u: u["words"] >= 500, 0, lambda u: (min(u["words"], 500), 500)),
+    ("spend_1000", "Потратить 1000 токенов", "Потратьте 1000 токенов",
+     lambda u: u["words"] >= 1000, 0, lambda u: (min(u["words"], 1000), 1000)),
+
+    ("streak_5", "Использовать бота 5 дней подряд", "Используйте бота 5 дней подряд",
+     lambda u: get_streak(u) >= 5, 0, lambda u: (min(get_streak(u), 5), 5)),
+    ("streak_14", "Использовать бота 14 дней подряд", "Используйте бота 14 дней подряд",
+     lambda u: get_streak(u) >= 14, 0, lambda u: (min(get_streak(u), 14), 14)),
+    ("streak_30", "Использовать бота 30 дней подряд", "Используйте бота 30 дней подряд",
+     lambda u: get_streak(u) >= 30, 0, lambda u: (min(get_streak(u), 30), 30)),
+
+    ("premium", "Купить Premium", "Купите подписку Premium",
+     lambda u: u["premium"], 0, lambda u: (1 if u["premium"] else 0, 1)),
+    ("premium_plus", "Купить Premium+", "Купите подписку Premium+",
+     lambda u: u["premium_plus"], 0, lambda u: (1 if u["premium_plus"] else 0, 1)),
+
+    ("ref_1", "Пригласить 1 друга", "Пригласите 1 друга",
+     lambda u: u["ref_count"] >= 1, 0, lambda u: (min(u["ref_count"], 1), 1)),
+    ("ref_3", "Пригласить 3 друзей", "Пригласите 3 друзей",
+     lambda u: u["ref_count"] >= 3, 0, lambda u: (min(u["ref_count"], 3), 3)),
+    ("ref_5", "Пригласить 5 друзей", "Пригласите 5 друзей",
+     lambda u: u["ref_count"] >= 5, 0, lambda u: (min(u["ref_count"], 5), 5)),
+    ("ref_10", "Пригласить 10 друзей", "Пригласите 10 друзей",
+     lambda u: u["ref_count"] >= 10, 0, lambda u: (min(u["ref_count"], 10), 10)),
+    ("ref_20", "Пригласить 20 друзей", "Пригласите 20 друзей",
+     lambda u: u["ref_count"] >= 20, 0, lambda u: (min(u["ref_count"], 20), 20)),
+    ("ref_30", "Пригласить 30 друзей", "Пригласите 30 друзей",
+     lambda u: u["ref_count"] >= 30, 0, lambda u: (min(u["ref_count"], 30), 30)),
+    ("ref_50", "Пригласить 50 друзей", "Пригласите 50 друзей",
+     lambda u: u["ref_count"] >= 50, 0, lambda u: (min(u["ref_count"], 50), 50)),
+
+    ("quest_1", "Выполнить 1 задание", "Выполните 1 задание",
+     lambda u: get_quests_done(u["user_id"]) >= 1, 0, lambda u: (min(get_quests_done(u["user_id"]), 1), 1)),
+    ("quest_3", "Выполнить 3 задания", "Выполните 3 задания",
+     lambda u: get_quests_done(u["user_id"]) >= 3, 0, lambda u: (min(get_quests_done(u["user_id"]), 3), 3)),
+
+    ("night_user", "Ночной пользователь", "Отправить сообщение с 2:00 до 5:00",
+     lambda u: u.get("last_message_time", 0) and 2 <= datetime.datetime.fromtimestamp(u["last_message_time"]).hour < 5, 0,
+     lambda u: (1 if u.get("last_message_time", 0) and 2 <= datetime.datetime.fromtimestamp(u["last_message_time"]).hour < 5 else 0, 1)),
+]
+
+def get_achievements_menu(user):
+    done = 0
+    menu = []
+    total = len(ACHIEVEMENTS)
+    for ach in ACHIEVEMENTS:
+        achieved = ach[3](user)
+        current, maximum = ach[5](user)
+        percent = int((current / maximum) * 100) if maximum else 100
+        if achieved:
+            icon = "✅"
+            done += 1
+        else:
+            icon = "❌"
+        line = f"{icon} <b>{ach[1]}</b>\n<i>{ach[2]}</i>"
+        # Если не бинарная ачивка, показываем прогресс
+        if maximum > 1:
+            line += f"\nПроцент выполнения: {percent}% ({current}/{maximum})"
+        menu.append(line)
+    total_percent = int(done / total * 100)
+    ach_text = f"🏆 <b>Достижения ({done}/{total})</b> — <b>{total_percent}%</b> выполнено\n\n" + "\n\n".join(menu)
+    return ach_text, total_percent
+
+def get_streak(user):
+    # streak - сколько дней подряд пользователь был активен
+    today = datetime.datetime.now().date()
+    last_active = user.get("last_active_date")
+    if not last_active:
+        return 0
+    streak = 0
+    for i in range(0, 31):
+        d = today - datetime.timedelta(days=i)
+        if execute_db("SELECT 1 FROM users WHERE user_id=? AND last_active_date=?", (user["user_id"], d.strftime("%Y-%m-%d")), fetchone=True):
+            streak += 1
+        else:
+            break
+    return streak
+
+def get_quests_done(user_id):
+    return execute_db("SELECT COUNT(*) FROM quest_claims WHERE user_id=?", (user_id,), fetchone=True)[0]
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -441,8 +624,13 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tokens = user_data.get("tokens", LIMITS["free"]["tokens"])
     model_key = user_data.get("model", "chatgpt_4_1_nano")
     model = AI_MODELS.get(model_key, AI_MODELS["chatgpt_4_1_nano"])["title"]
+    reply_keyboard = [
+        ["👤 Профиль", "⚙️Настройки"],
+        ["💎 Купить режим"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     text = (
-        f"👤 <b>Профиль пользователя</b> @{username}\n"
+        f"👤 <b>Профиль пользователя</b> @{username}\n\n"
         f"📆 <b>Последняя активность:</b> {user_data.get('last_active_date').strftime('%d.%m.%Y')}\n"
         f"⭐️ <b>Статус:</b> {'<b>Premium+</b> 👑' if is_premium_plus else ('<b>Premium</b> ✅' if is_premium else '<b>Базовый</b> ❌')}\n"
         + (f"⏳ <b>Дней Premium осталось:</b> <b>{days_left}</b>\n" if is_premium else "")
@@ -450,27 +638,15 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 <b>Текущая модель:</b> <b>{model}</b>\n"
         f"📢 <b>Подписка на основные каналы:</b> {'Активна ✅' if subscribed else 'Неактивна ❌'}\n\n"
         "ℹ️ <i>Токены обновляются раз в 24 часа. Используйте их для общения с ИИ и генерации изображений. "
-        "Премиум даёт больше токенов и бонусов!</i>\n"
+        "Подписка даёт больше токенов и бонусов!</i>\n"
     )
-    reply_keyboard = [
-        ["👤 Профиль", "⚙️Настройки", "💎 Купить режим"]
-    ]
-    reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-    kb = [
-        [InlineKeyboardButton("💎 Купить Premium", callback_data="buy_premium_info")]
-    ]
     await context.bot.send_message(
         user_id,
         text,
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
-    await context.bot.send_message(
-        user_id,
-        "Хотите больше возможностей?\n"
-        "Получите Premium 👑 и получите больше токенов, бонусов и приоритетный доступ!",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -501,10 +677,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ref_count": 0,
             "last_message_time": 0,
             "last_active_date": now,
+            "last_image_gen_date": None,
         }
         update_user_data(user_id, user)
     reply_keyboard = [
-        ["👤 Профиль", "⚙️Настройки", "💎 Купить режим"]
+        ["👤 Профиль", "⚙️Настройки"],
+        ["💎 Купить режим"]
     ]
     reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     subscribed = await check_subscription(user_id, context)
@@ -558,32 +736,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await profile(update, context)
 
     elif query.data == "buy_premium_info":
-        text, kb = get_premium_message_and_keyboard()
+        text = get_premium_message()
+        kb = get_premium_payment_keyboard(payment_method="donationalerts")
         await query.message.reply_text(
             text,
             reply_markup=kb,
             parse_mode="HTML"
         )
 
+    elif query.data == "buy_premium_select_donationalerts":
+        text = get_premium_message()
+        kb = get_premium_payment_keyboard(payment_method="donationalerts")
+        if query.message.text != text:
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await query.edit_message_reply_markup(reply_markup=kb)
+
+    elif query.data == "buy_premium_select_cryptobot":
+        text = get_premium_message()
+        kb = get_premium_payment_keyboard(payment_method="cryptobot")
+        if query.message.text != text:
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await query.edit_message_reply_markup(reply_markup=kb)
+
     elif query.data == "choose_text_model_menu":
-        await query.message.delete()
         model_buttons, _ = get_model_buttons(get_user_data(user_id).get("model"))
         model_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")])
-        await context.bot.send_message(user_id, "🤖 <b>Выберите текстовую модель ИИ:</b>", reply_markup=InlineKeyboardMarkup(model_buttons), parse_mode="HTML")
+        await query.edit_message_text("🤖 <b>Выберите текстовую модель ИИ:</b>\n\n"
+                                      "Каждая текстовая модель - это ваш персональный помощник для учебы, работы и творчества!\n\n"
+                                      "<b>Текстовые модели умеют:</b>\n"
+                                      "- Писать рефераты и сочинения\n"
+                                      "- Помогать с ответами на вопросы\n"
+                                      "- Составлять письма, тексты, инструкции\n"
+                                      "- Переводить, редактировать, резюмировать и многое другое\n\n"
+                                      "💡 <i>Выберите подходящую модель ниже, чтобы получать наилучшие ответы под ваши задачи!</i>"
+                                      , reply_markup=InlineKeyboardMarkup(model_buttons), parse_mode="HTML")
 
     elif query.data == "choose_image_model_menu":
-        await query.message.delete()
         _, img_buttons = get_model_buttons(get_user_data(user_id).get("model"))
         img_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")])
-        await context.bot.send_message(user_id, "🖼️ <b>Выберите модель генерации изображений:</b>", reply_markup=InlineKeyboardMarkup(img_buttons), parse_mode="HTML")
+        await query.edit_message_text("<b>🖼️ Генерация изображений искусственным интеллектом</b>\n\n"
+                                     "<i>В этом разделе вы можете выбрать модель для генерации ваших изображений по вашему запросу!</i>\n\n"
+                                     "<b>Что умеют модели генерации изображений</b>\n"
+                                     "- Создавать яркие иллюстрации по текстовому описанию\n"
+                                     "- Генерировать креативные обложки, мемы, арты\n"
+                                     "- Помогать с визуализацией идей для учебы, работы или творчества\n\n"
+                                     "💡 <i>Отправьте фразу:</i>\n"
+                                     "<code>Генерация: </code><i>Ваш запрос </i>\n\n"
+                                     "Люди с подпиской (Premium и Premium+) имеют возможность сгенерировать 1 изображение в сутки\n"
+                                     "<i>Для пользователей базового режима функция недоступна</i>",
+                                     reply_markup=InlineKeyboardMarkup(img_buttons),
+                                     parse_mode="HTML")
 
     elif query.data == "settings_menu":
-        await query.message.delete()
         kb = get_settings_menu()
-        await context.bot.send_message(user_id, 
+        await query.edit_message_text(
             "⚙️ <b>Меню настроек:</b>\n\n"
             "• Здесь вы можете выбрать нужную модель ИИ, узнать о бонусах и заданиях, а также вернуться к своему профилю.\n"
-            "• Премиум-аккаунт даёт больше токенов и расширяет ваши возможности!",
+            "• Премиум-аккаунт открывает расширенные лимиты и новые функции!",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
     elif query.data.startswith("choose_model_"):
@@ -593,12 +804,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user_data["model"] = model_key
         update_user_data(user_id, user_data)
-        await query.message.delete()
         model = AI_MODELS[model_key]
         kb = [
             [
                 InlineKeyboardButton(
-                    f"💎 Выбрать {model['title']} за {model['price']} ток.",
+                    f"💎Выбрать ({model['title']})",
                     callback_data=f"use_model_{model_key}"
                 )
             ],
@@ -606,7 +816,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔙 Назад", callback_data="choose_text_model_menu" if model["type"] == "text" else "choose_image_model_menu")
             ]
         ]
-        await context.bot.send_message(user_id, f"🤖 <b>{model['title']}</b>\n\nЦена за 1 запрос: <b>{model['price']} токенов</b>.\nНажмите кнопку ниже для выбора.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        await query.edit_message_text(f"🤖 <b>{model['title']}</b>\n\nЦена за 1 запрос: <b>{model['price']} токенов</b>.\nНажмите кнопку ниже для выбора.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
     elif query.data.startswith("use_model_"):
         model_key = query.data[len("use_model_"):]
@@ -615,29 +825,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user_data["model"] = model_key
         update_user_data(user_id, user_data)
-        await query.message.delete()
-        await context.bot.send_message(user_id, f"🤖 <b>Модель {AI_MODELS[model_key]['title']}</b> установлена!\nТеперь ваши запросы будут выполняться с помощью этой модели.", parse_mode="HTML")
+        await query.edit_message_text(f"🤖 <b>Модель {AI_MODELS[model_key]['title']}</b> установлена!\nТеперь ваши запросы будут выполняться с помощью этой модели.", parse_mode="HTML")
         await profile(update, context)
 
     elif query.data == "bonuses_info":
-        await query.message.delete()
         kb = [
             [InlineKeyboardButton("👥 Пригласить друга", callback_data="referral_info")],
             [InlineKeyboardButton("🎯 Задания", callback_data="quests_info")],
             [InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")]
         ]
-        await context.bot.send_message(user_id, (
+        await query.edit_message_text(
             "🎁 <b>Бонусы и задания</b>\n\n"
             "• Получайте дополнительные токены за приглашение друзей или выполнение простых заданий — подписки на дополнительные каналы.\n"
-            "• Выберите нужный раздел ниже 👇"),
+            "• Выберите нужный раздел ниже 👇",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
     elif query.data == "referral_info":
-        await query.message.delete()
         referral_code = get_or_create_referral_code(user_id)
         user_data = get_user_data(user_id)
         ref_bonus = LIMITS["premium_plus" if user_data.get("premium_plus") else "premium" if user_data.get("premium") else "free"]["ref_bonus"]
-        premium = user_data.get("premium_plus") or user_data.get("premium")
         text = (
             "👥 <b>Пригласите друга!</b>\n\n"
             "• Поделитесь личной реферальной ссылкой и получите <b>{}</b> токенов за каждого друга!\n"
@@ -646,11 +852,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<code>https://t.me/{botname}?start={ref}</code>\n\n"
             "<i>Чем больше друзей — тем больше токенов!</i>\n"
         ).format(ref_bonus, "Premium+" if user_data.get("premium_plus") else ("Premium" if user_data.get("premium") else "Базовый"), botname=context.bot.username, ref=referral_code)
-        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")]]
-        await context.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        kb = [
+            [InlineKeyboardButton("👫 Ваши друзья", callback_data="referral_friends")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == "referral_friends":
+        info_text = get_referrals_info(user_id)
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="referral_info")]]
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
     elif query.data == "quests_info":
-        await query.message.delete()
         quest_channels = get_quest_channels()
         kb = []
         for ch_url, bonus in quest_channels:
@@ -659,8 +872,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("Проверить", callback_data=f"quest_check_{ch_url}")
             ])
         kb.append([InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")])
-        await context.bot.send_message(
-            user_id,
+        await query.edit_message_text(
             "🎯 <b>Задания</b>\n\n"
             "• Подпишитесь на любой из каналов ниже и получите токены! "
             "Нажмите «Проверить» после подписки.\n"
@@ -683,8 +895,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❗️ Вы не подписаны на этот канал. Подпишитесь и повторите попытку.")
 
     elif query.data == "back_to_profile":
-        await query.message.delete()
         await profile(update, context)
+
+    elif query.data == "achievements_menu":
+        user = get_user_data(user_id)
+        if user:
+            user["user_id"] = user_id  # для get_quests_done
+            ach_text, percent = get_achievements_menu(user)
+            kb = [[InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")]]
+            await query.edit_message_text(ach_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -702,39 +921,43 @@ async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_premium_plus = data.get("premium_plus", False)
     tokens = data.get("tokens", 0)
     model_key = data.get("model", "chatgpt_4_1_nano")
-    if model_key not in AI_MODELS:
-        model_key = "chatgpt_4_1_nano"
-    model = AI_MODELS[model_key]
-    price = model["price"]
-    word_count = len(msg.text.split())
+    text = msg.text.strip()
+    today = datetime.datetime.now().date()
     limit_type = "premium_plus" if is_premium_plus else "premium" if is_premium else "free"
-    if word_count > LIMITS[limit_type]["word_limit"]:
-        await msg.reply_text(f"❌ Максимальное количество слов в запросе — {LIMITS[limit_type]['word_limit']}.")
-        return
-    if tokens < price:
-        await msg.reply_text(f"❌ Недостаточно токенов! Пополните баланс через приглашения или задания.")
-        return
-
-    context_history = user_context[user_id]
-    context_history.append({"role": "user", "content": msg.text})
-    if len(context_history) > 10:
-        context_history[:] = context_history[-10:]
-
-    data["tokens"] -= price
-    data["words"] += word_count
-    data["last_message_time"] = int(time.time())
-    data["last_active_date"] = datetime.datetime.now()
-    update_user_data(user_id, data)
-    thinking_msg = await msg.reply_text("🧠 Думаю...")
-
-    try:
-        if model_key == "dall_e":
+    if text.lower().startswith("генерация:"):
+        if not (is_premium or is_premium_plus):
+            await msg.reply_text("⚠️ Генерация изображений доступна только для Premium и Premium+ пользователей.")
+            return
+        last_img_date = data.get("last_image_gen_date")
+        if last_img_date is not None and last_img_date.date() == today:
+            await msg.reply_text("⚠️ Вы уже использовали свою генерацию изображения сегодня. Новая будет доступна завтра.")
+            return
+        img_model_key = None
+        for k, v in AI_MODELS.items():
+            if v["type"] == "image":
+                img_model_key = k
+        if not img_model_key:
+            await msg.reply_text("⚠️ Не настроена модель генерации изображений.")
+            return
+        model = AI_MODELS[img_model_key]
+        price = model["price"]
+        if tokens < price:
+            await msg.reply_text(f"❌ Недостаточно токенов! Пополните баланс через приглашения или задания.")
+            return
+        data["tokens"] -= price
+        data["last_message_time"] = int(time.time())
+        data["last_active_date"] = datetime.datetime.now()
+        data["last_image_gen_date"] = today
+        update_user_data(user_id, data)
+        thinking_msg = await msg.reply_text("🖼️ Генерирую изображение...")
+        user_prompt = text[len("генерация:"):].strip()
+        try:
             headers = {
                 "Authorization": f"Bearer {model['api_key']}",
                 "Content-Type": "application/json",
             }
             payload = {
-                "prompt": msg.text,
+                "prompt": user_prompt,
                 "n": 1,
                 "size": "1024x1024"
             }
@@ -747,22 +970,51 @@ async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await msg.reply_photo(image_url, caption="🖼️ Ваше сгенерированное изображение!")
             else:
                 await msg.reply_text("⚠️ Не удалось сгенерировать изображение.")
-            user_context[user_id] = []
-            return
-        else:
-            headers = {
-                "Authorization": f"Bearer {model['api_key']}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model["model_id"],
-                "messages": context_history,
-            }
-            r = requests.post(model["api_url"], headers=headers, json=payload, timeout=60)
-            r.raise_for_status()
-            response_data = r.json()
-            response = response_data["choices"][0]["message"]["content"].strip()
-            context_history.append({"role": "assistant", "content": response})
+        except Exception as e:
+            logging.error(f"Ошибка при обращении к ИИ: {e}")
+            await thinking_msg.delete()
+            await msg.reply_text("⚠️ Ошибка при обращении к ИИ.")
+        user_context[user_id] = []
+        return
+    if "генерация:" in text.lower() and not (is_premium or is_premium_plus):
+        await msg.reply_text("⚠️ Генерация изображений доступна только для Premium и Premium+ пользователей.")
+        return
+    if not model_key or model_key not in AI_MODELS or AI_MODELS[model_key]["type"] != "text":
+        model_key = "chatgpt_4_1_nano"
+    model = AI_MODELS[model_key]
+    price = model["price"]
+    word_count = len(msg.text.split())
+    if word_count > LIMITS[limit_type]["word_limit"]:
+        await msg.reply_text(f"❌ Максимальное количество слов в запросе — {LIMITS[limit_type]['word_limit']}.")
+        return
+    if tokens < price:
+        await msg.reply_text(f"❌ Недостаточно токенов! Пополните баланс через приглашения или задания.")
+        return
+    context_history = user_context[user_id]
+    context_history.append({"role": "user", "content": msg.text})
+    if len(context_history) > 10:
+        context_history[:] = context_history[-10:]
+    data["tokens"] -= price
+    data["words"] += word_count
+    data["last_message_time"] = int(time.time())
+    data["last_active_date"] = datetime.datetime.now()
+    update_user_data(user_id, data)
+    thinking_msg = await msg.reply_text("🧠 Думаю...")
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {model['api_key']}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model["model_id"],
+            "messages": context_history,
+        }
+        r = requests.post(model["api_url"], headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        response_data = r.json()
+        response = response_data["choices"][0]["message"]["content"].strip()
+        context_history.append({"role": "assistant", "content": response})
     except Exception as e:
         logging.error(f"Ошибка при обращении к ИИ: {e}")
         response = "⚠️ Ошибка при обращении к ИИ."
@@ -798,7 +1050,8 @@ async def keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     elif text == "💎 Купить режим":
-        msg, kb = get_premium_message_and_keyboard()
+        msg = get_premium_message()
+        kb = get_premium_payment_keyboard(payment_method="donationalerts")
         await context.bot.send_message(
             update.effective_user.id,
             msg,
@@ -994,6 +1247,7 @@ async def daily_token_reset(context: ContextTypes.DEFAULT_TYPE):
         else:
             data["tokens"] = LIMITS["free"]["tokens"]
         data["last_reset"] = now
+        data["last_image_gen_date"] = None
         update_user_data(user_id, data)
 
 async def donationalerts_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
