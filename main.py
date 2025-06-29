@@ -262,6 +262,7 @@ def get_user_data(user_id):
     row = execute_db("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if row:
         return {
+            "user_id": row[0], 
             "tokens": row[1],
             "words": row[2],
             "premium": bool(row[3]),
@@ -284,7 +285,7 @@ def get_user_data_by_username(username):
     row = execute_db("SELECT * FROM users WHERE LOWER(username) = ?", (username,), fetchone=True)
     if row:
         return {
-            "user_id": row[0],
+            "user_id": row[0], 
             "tokens": row[1],
             "words": row[2],
             "premium": bool(row[3]),
