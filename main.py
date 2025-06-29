@@ -25,6 +25,9 @@ from telegram.ext import (
 from aiogram.types import Message
 from collections import defaultdict
 from multiprocessing import Queue
+from collections import deque
+
+donation_queue = deque()
 
 donation_queue = Queue()
 
@@ -129,7 +132,7 @@ conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 
 def execute_db(query, params=(), fetchone=False, commit=False):
-    for attempt in range(5):
+    for attempt in range(10):
         try:
             cur = conn.cursor()
             cur.execute(query, params)
@@ -138,7 +141,7 @@ def execute_db(query, params=(), fetchone=False, commit=False):
             return cur.fetchone() if fetchone else cur.fetchall()
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e):
-                time.sleep(0.1)
+                time.sleep(0.2)
             else:
                 raise
     raise sqlite3.OperationalError("Database locked after retries")
@@ -299,6 +302,52 @@ def get_user_data_by_username(username):
         }
     return None
 
+async def fetch_user_data_by_username(username):
+    username = username.lstrip("@").lower()
+    user_data = get_user_data_by_username(username)
+    return user_data
+
+async def fetch_or_create_user_by_username(username, context):
+    username = username.lstrip("@").lower()
+    user_data = get_user_data_by_username(username)
+    if user_data:
+        return user_data
+
+    try:
+        chat = await context.bot.get_chat(username)
+        user_id = chat.id
+        user_data = get_user_data(user_id)
+        if not user_data:
+
+            now = datetime.datetime.now()
+            today = now.date()
+            user = {
+                "tokens": LIMITS["free"]["tokens"],
+                "words": 0,
+                "premium": False,
+                "premium_plus": False,
+                "expires_at": None,
+                "last_reset": now,
+                "username": username,
+                "model": "chatgpt_4_1_nano",
+                "referred_by": None,
+                "ref_count": 0,
+                "last_message_time": 0,
+                "last_active_date": now,
+                "last_image_gen_date": today,
+            }
+            update_user_data(user_id, user)
+            return get_user_data(user_id)
+        else:
+            
+            if not user_data.get("username"):
+                user_data["username"] = username
+                update_user_data(user_id, user_data)
+            return user_data
+    except Exception as e:
+        print(f"Ошибка поиска пользователя @{username} через Telegram API: {e}")
+        return None
+
 def get_or_create_referral_code(user_id):
     if not get_user_data(user_id):
         now = datetime.datetime.now()
@@ -453,6 +502,32 @@ def get_or_create_referral_code(user_id):
     execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
     return new_code
 
+async def process_donations(context: ContextTypes.DEFAULT_TYPE):
+    while not donation_queue.empty():
+        try:
+            donation_data = donation_queue.get_nowait()
+            telegram_username = donation_data.get("username")
+            
+            if not telegram_username:
+                print("❗ Username не найден в данных доната")
+                continue
+            
+            user_data = get_user_data_by_username(telegram_username)
+            if not user_data:
+                print(f"❗ Пользователь {telegram_username} не найден в базе")
+                continue
+            
+            chat_id = user_data["user_id"]
+            activate_premium_for_user(chat_id)
+            print(f"✅ Premium активирован для {telegram_username}")
+        
+        except asyncio.QueueEmpty:
+            break
+        except Exception as e:
+            logging.error(f"Ошибка обработки доната: {e}")
+
+
+
 async def get_chat_id_by_username(username: str, context) -> int | None:
     try:
         username = username.replace("@", "")
@@ -474,7 +549,22 @@ def activate_premium_for_user(user_id: int, days: int = 30):
     conn.commit()
     conn.close()
 
-def update_user_subscription(user_id: int, subscription_type: str, context=None):
+def activate_premium_for_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    expires_at = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute("""
+        UPDATE users
+        SET premium = 1,
+            premium_plus = 0,
+            expires_at = ?,
+            tokens = ?
+        WHERE user_id = ?
+    """, (expires_at, LIMITS["premium"]["tokens"], user_id))
+    conn.commit()
+    conn.close
+
+async def update_user_subscription(user_id: int, subscription_type: str, context=None):
     now = datetime.datetime.now()
     expires = now + datetime.timedelta(days=PREMIUM_PLUS_DAYS if subscription_type == "premium_plus" else PREMIUM_DAYS)
     data = get_user_data(user_id) or {
@@ -492,22 +582,22 @@ def update_user_subscription(user_id: int, subscription_type: str, context=None)
     if subscription_type == "premium_plus":
         data["premium"] = True
         data["premium_plus"] = True
-        data["expires_at"] = expires
         data["tokens"] = LIMITS["premium_plus"]["tokens"]
     else:
         data["premium"] = True
         data["premium_plus"] = False
-        data["expires_at"] = expires
         data["tokens"] = LIMITS["premium"]["tokens"]
+
+    data["expires_at"] = expires
     update_user_data(user_id, data)
     if context:
         try:
             msg = (
-                f"✅ Ваша подписка <b>{'Premium+' if subscription_type=='premium_plus' else 'Premium'}</b> активирована!\n\n"
+                f"✅ Ваша подписка <b>{'Premium+' if subscription_type == 'premium_plus' else 'Premium'}</b> активирована!\n\n"
                 f"Теперь ваши лимиты увеличены: {data['tokens']} токенов ежедневно, расширенные бонусы и приоритетный доступ к ИИ.\n"
                 "Спасибо за поддержку и приятного использования! 🎉"
             )
-            context.bot.send_message(user_id, msg, parse_mode="HTML")
+            await context.bot.send_message(user_id, msg, parse_mode="HTML")
         except Exception as e:
             logging.error(f"Ошибка при отправке уведомления об активации премиума: {e}")
 
@@ -708,8 +798,9 @@ def get_premium_payment_keyboard(payment_method="donationalerts"):
 def get_premium_message():
     text = (
         "💎 <b>Покупка Premium или Premium+</b> 💎\n\n"
-        "1️⃣ Выберите способ оплаты и вид подписки\n"
-        "2️⃣ Оплатите выбранную подписку через DonationAlerts или CryptoBot\n\n"
+        "1️⃣ Перед покупкой привяжите свой акканут через команду <i>/link</i>\n"
+        "2️⃣ Выберите способ оплаты и вид подписки\n"
+        "3️⃣ Оплатите выбранную подписку через DonationAlerts или CryptoBot\n\n"
         "<b>Преимущества:</b>\n"
         "• <b>Premium:</b> 300 токенов ежедневно, увеличенные бонусы за друзей и задания, приоритетный доступ\n"
         "• <b>Premium+:</b> 500 токенов ежедневно, максимальные бонусы и эксклюзивные возможности\n\n"
@@ -1022,8 +1113,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(" CALLBACK RECEIVED:", update.callback_query.data)
     query = update.callback_query
     await query.answer()
+    print("Processing data:", query.data)
     user_id = query.from_user.id
     user_data = get_user_data(user_id)
 
@@ -1340,6 +1433,13 @@ async def show_manual_payment_screen(query, context, method: str, tier: str):
     )
 
 async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username:
+        user_id = update.effective_user.id
+    data = get_user_data(user_id)
+    if data and (not data.get("username") or data["username"].lower() != update.effective_user.username.lower()):
+        data["username"] = update.effective_user.username.lower()
+        update_user_data(user_id, data)
+    
     msg = update.message
     if not msg or not msg.from_user or (msg.chat and msg.chat.type == "channel"):
         return
@@ -1458,6 +1558,8 @@ async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         response = "⚠️ Ошибка при обращении к ИИ."
     await thinking_msg.delete()
     await msg.reply_text(response)
+
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(msg="Exception while handling an update:", exc_info=context.error)
@@ -1704,14 +1806,32 @@ async def link_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ У вас нет username в Telegram. Задайте его в настройках Telegram.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)", (user_id, username.lower()))
-    conn.commit()
-    conn.close()
+    user_data = get_user_data(user_id)
+    if user_data:
+        user_data['username'] = username.lower()
+        update_user_data(user_id, user_data)
+    else:
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": username.lower(),
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
 
-    await update.message.reply_text(f"🔗 Ваш профиль Telegram (@{username}) успешно привязан!")          
-
+    await update.message.reply_text(f"🔗 Ваш профиль Telegram (@{username}) успешно привязан!")
+    
 async def handle_donation(data, context):
     try:
         donation = data["data"][0]
@@ -1727,9 +1847,12 @@ async def handle_donation(data, context):
         if not user_data:
             print(f"❌ Пользователь {username} не найден в базе.")
             return
-
+        
         user_id = user_data["user_id"]
-
+        if username and (not user_data.get("username") or user_data.get("username").lower() != username.lower()):
+            user_data["username"] = username.lower()
+            update_user_data(user_id, user_data)
+            
         if amount >= 499:
             subscription_type = "premium_plus"
         elif amount >= 249:
@@ -1754,6 +1877,30 @@ def extract_telegram_username(message_text: str) -> str | None:
     match = re.search(r'@[\w\d_]{5,}', message_text)
     return match.group(0) if match else None
 
+async def process_donations(context: ContextTypes.DEFAULT_TYPE):
+    while not donation_queue.empty():
+        try:
+            donation_data = donation_queue.get_nowait()
+            telegram_username = donation_data.get("username")
+            
+            if not telegram_username:
+                print("❗ Username не найден в данных доната")
+                continue
+            
+            user_data = get_user_data_by_username(telegram_username)
+            if not user_data:
+                print(f"❗ Пользователь {telegram_username} не найден в базе")
+                continue
+            
+            chat_id = user_data["user_id"]
+            activate_premium_for_user(chat_id)
+            print(f"✅ Premium активирован для {telegram_username}")
+        
+        except asyncio.QueueEmpty:
+            break
+        except Exception as e:
+            logging.error(f"Ошибка обработки доната: {e}")
+
 async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1765,16 +1912,22 @@ async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ Использование: /premium @username")
         return
 
-    username = args[0].lstrip('@').lower()
-    user_data = get_user_data_by_username(username)
+    username = args[0].lstrip('@')
+    user_data = await fetch_user_data_by_username(username)
     if not user_data:
-        await update.message.reply_text(f"❌ Пользователь @{username} не найден.")
+        await update.message.reply_text(
+            f"❌ Пользователь @{username} не найден. "
+            "Попросите его зайти в бота и воспользоваться командой /link."
+        )
         return
 
     update_user_subscription(user_data["user_id"], "premium", context)
     await update.message.reply_text(f"✅ Пользователь @{username} получил Premium!")
-    await context.bot.send_message(chat_id=user_data["user_id"], text="🎉 <b>Вам выдан Premium!</b> Спасибо за поддержку ❤️", parse_mode="HTML")
-
+    await context.bot.send_message(
+        chat_id=user_data["user_id"],
+        text="🎉 <b>Вам выдан Premium!</b> Спасибо за поддержку ❤️",
+        parse_mode="HTML"
+    )
 
 async def give_premium_plus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1787,29 +1940,73 @@ async def give_premium_plus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ Использование: /premiumplus @username")
         return
 
-    username = args[0].lstrip('@').lower()
-    user_data = get_user_data_by_username(username)
+    username = args[0].lstrip('@')
+    user_data = await fetch_user_data_by_username(username)
     if not user_data:
-        await update.message.reply_text(f"❌ Пользователь @{username} не найден.")
+        await update.message.reply_text(
+            f"❌ Пользователь @{username} не найден. "
+            "Попросите его зайти в бота и воспользоваться командой /link."
+        )
         return
 
     update_user_subscription(user_data["user_id"], "premium_plus", context)
     await update.message.reply_text(f"✅ Пользователь @{username} получил Premium+!")
-    await context.bot.send_message(chat_id=user_data["user_id"], text="🎉 <b>Вам выдан Premium+!</b> Спасибо за поддержку ❤️", parse_mode="HTML")
-async def process_donations(context: ContextTypes.DEFAULT_TYPE):
-
+    await context.bot.send_message(
+        chat_id=user_data["user_id"],
+        text="🎉 <b>Вам выдан Premium+!</b> Спасибо за поддержку ❤️",
+        parse_mode="HTML"
+    )
+       
+async def delete_donation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
     
-    while not donation_queue.empty():
-        donation_data = donation_queue.get()
-        telegram_username = donation_data.get("username")
-        chat_id = await get_chat_id_by_username(telegram_username, context)
-        if chat_id:
-            activate_premium_for_user(chat_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="🎉 Спасибо за донат! Premium активирован на 30 дней!"
-            )
+    args = context.args
+    if not args or not args[0].startswith("@"):
+        await update.message.reply_text("❗ Использование: /deletedon @username")
+        return
+    
+    username = args[0].lstrip('@').lower()
+    
 
+    user_data = None
+    for _ in range(5):  
+        user_data = get_user_data_by_username(username)
+        if user_data:
+            break
+        await asyncio.sleep(0.5) 
+    
+    if not user_data:
+        await update.message.reply_text(f"❌ Пользователь @{username} не найден.")
+        return
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""UPDATE users ...""", (...))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка при удалении доната: {e}")
+
+        await context.bot.send_message(
+            chat_id=user_data["user_id"],
+            text="⚠️ Ваш Premium статус был отменён администратором."
+        )
+        
+
+        await update.message.reply_text(f"✅ Донат пользователя @{username} успешно удалён!")
+    
+    except Exception as e:
+        logging.error(f"Ошибка при удалении доната: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка при удалении доната.")
+    
+    finally:
+        if conn:
+            conn.close()
+        
+        
 async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -1836,6 +2033,24 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML"
     )
 
+def activate_premium_for_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    expires_at = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    
+    cursor.execute("""
+        UPDATE users
+        SET premium = 1,
+            premium_plus = 0,
+            expires_at = ?,
+            tokens = ?
+        WHERE user_id = ?
+    """, (expires_at, LIMITS["premium"]["tokens"], user_id))
+    
+    conn.commit()
+    conn.close()
+
 def main():
     init_db()
     migrate_db()
@@ -1851,6 +2066,7 @@ def main():
     application.add_handler(CommandHandler("add", add_ad))
     application.add_handler(CommandHandler("addstat", addstat))
     application.add_handler(CommandHandler("adddelete", adddelete))
+    application.add_handler(CommandHandler("deletedon", delete_donation))
     application.add_handler(MessageHandler(filters.PHOTO, handle_payment_proof))
     application.add_handler(CommandHandler("stat", stat))
     application.add_handler(CommandHandler("adc", adc))
