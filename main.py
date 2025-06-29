@@ -508,25 +508,20 @@ async def process_donations(context: ContextTypes.DEFAULT_TYPE):
         try:
             donation_data = donation_queue.get_nowait()
             telegram_username = donation_data.get("username")
-            
             if not telegram_username:
                 print("❗ Username не найден в данных доната")
                 continue
-            
             user_data = get_user_data_by_username(telegram_username)
             if not user_data:
                 print(f"❗ Пользователь {telegram_username} не найден в базе")
                 continue
-            
             chat_id = user_data["user_id"]
             await update_user_subscription(chat_id, "premium", context)
             print(f"✅ Premium активирован для {telegram_username}")
-                    
         except asyncio.QueueEmpty:
             break
         except Exception as e:
             logging.error(f"Ошибка обработки доната: {e}")
-
 
 
 async def get_chat_id_by_username(username: str, context) -> int | None:
@@ -538,21 +533,6 @@ async def get_chat_id_by_username(username: str, context) -> int | None:
         print(f"Ошибка получения chat_id для @{username}: {e}")
         return None
     
-def activate_premium_for_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    expires_at = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute("""
-        UPDATE users
-        SET premium = 1,
-            premium_plus = 0,
-            expires_at = ?,
-            tokens = ?
-        WHERE user_id = ?
-    """, (expires_at, LIMITS["premium"]["tokens"], user_id))
-    conn.commit()
-    conn.close
-
 async def update_user_subscription(user_id: int, subscription_type: str, context=None):
     now = datetime.datetime.now()
     expires = now + datetime.timedelta(days=PREMIUM_PLUS_DAYS if subscription_type == "premium_plus" else PREMIUM_DAYS)
@@ -1871,25 +1851,20 @@ async def process_donations(context: ContextTypes.DEFAULT_TYPE):
         try:
             donation_data = donation_queue.get_nowait()
             telegram_username = donation_data.get("username")
-            
             if not telegram_username:
                 print("❗ Username не найден в данных доната")
                 continue
-            
             user_data = get_user_data_by_username(telegram_username)
             if not user_data:
                 print(f"❗ Пользователь {telegram_username} не найден в базе")
                 continue
-            
             chat_id = user_data["user_id"]
             await update_user_subscription(chat_id, "premium", context)
             print(f"✅ Premium активирован для {telegram_username}")
-                    
         except asyncio.QueueEmpty:
             break
         except Exception as e:
             logging.error(f"Ошибка обработки доната: {e}")
-
 async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2021,24 +1996,6 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         "Если возникнут вопросы — напишите @ggselton 💬",
         parse_mode="HTML"
     )
-
-def activate_premium_for_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    expires_at = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    
-    cursor.execute("""
-        UPDATE users
-        SET premium = 1,
-            premium_plus = 0,
-            expires_at = ?,
-            tokens = ?
-        WHERE user_id = ?
-    """, (expires_at, LIMITS["premium"]["tokens"], user_id))
-    
-    conn.commit()
-    conn.close()
 
 def main():
     init_db()
