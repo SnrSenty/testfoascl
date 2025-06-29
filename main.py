@@ -3,7 +3,10 @@ import datetime
 import sqlite3
 import time
 import requests
+import asyncio
 import random
+import json
+import re
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -19,12 +22,16 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from aiogram.types import Message
 from collections import defaultdict
+from multiprocessing import Queue
+
+donation_queue = Queue()
 
 CHANNEL_IDS = ["@aisocialnull", "@digital_v_teme"]
 AD_CHANNEL_ID = "@channelaibotad"
 BOT_TOKEN = "7920009590:AAFG6T5NHqron96oyUSST_nXJhsqz3J4TeE"
-ADMIN_ID_LIST = [5191720312, 7960796663]
+ADMIN_ID_LIST = [5191720312]
 DB_FILE = "users.db"
 PREMIUM_DAYS = 30
 PREMIUM_PLUS_DAYS = 30
@@ -34,6 +41,20 @@ DONATIONALERTS_PREMIUM_LINK = "https://www.donationalerts.com/test/premium"
 DONATIONALERTS_PREMIUM_PLUS_LINK = "https://www.donationalerts.com/test/premium-plus"
 CRYPTOBOT_PREMIUM_LINK = "https://t.me/CryptoBot?start=example-premium"
 CRYPTOBOT_PREMIUM_PLUS_LINK = "https://t.me/CryptoBot?start=example-premiumplus"
+
+DONATIONALERTS_PREMIUM_PRICE = "249₽"
+DONATIONALERTS_PREMIUM_PLUS_PRICE = "499₽"
+
+CRYPTOBOT_PREMIUM_PRICE = "249₽"
+CRYPTOBOT_PREMIUM_PLUS_PRICE = "499₽"
+
+PREMIUM_PRICE = "249₽"
+PREMIUM_PLUS_PRICE = "499₽"
+
+PREMIUM_IMAGE_URL = "https://t.me/channelaibotad/11"
+
+
+DB_PATH = "users.db"
 
 AI_MODELS = {
     "chatgpt_4_1_nano": {
@@ -72,9 +93,9 @@ AI_MODELS = {
         "title": "Deepseek v3",
         "price": 25,
         "type": "text",
-        "api_url": "deepseek/deepseek-chat-v3-0324:free",
-        "api_key": "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",
-        "model_id": "deepseek-chat-v3"
+        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+        "api_key": "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",
+        "model_id": "deepseek/deepseek-chat-v3-0324:free"
     },
     "deepseek_r1": {
         "title": "Deepseek R1",
@@ -186,8 +207,8 @@ def init_db():
     """, commit=True)
     columns = execute_db("PRAGMA table_info(users)", fetchone=False)
     colnames = [c[1] for c in columns]
-    if "last_image_gen_date" not in colnames:
-        execute_db("ALTER TABLE users ADD COLUMN last_image_gen_date TEXT DEFAULT NULL", commit=True)
+    if "username" not in colnames:
+        execute_db("ALTER TABLE users ADD COLUMN username TEXT", commit=True)
 
 def migrate_db():
     columns = execute_db("PRAGMA table_info(users)", fetchone=False)
@@ -255,10 +276,103 @@ def get_user_data(user_id):
         }
     return None
 
+def get_user_data_by_username(username):
+    username = username.lower() 
+    row = execute_db("SELECT * FROM users WHERE LOWER(username) = ?", (username,), fetchone=True)
+    if row:
+        return {
+            "user_id": row[0],
+            "tokens": row[1],
+            "words": row[2],
+            "premium": bool(row[3]),
+            "premium_plus": bool(row[4]),
+            "expires_at": datetime.datetime.strptime(row[5], "%Y-%m-%d %H:%M:%S") if row[5] else None,
+            "last_reset": datetime.datetime.strptime(row[6], "%Y-%m-%d %H:%M:%S") if row[6] else None,
+            "model": row[7] or "chatgpt_4_1_nano",
+            "referred_by": row[8],
+            "ref_count": row[9] or 0,
+            "last_message_time": row[10] or 0,
+            "last_active_date": datetime.datetime.strptime(row[11], "%Y-%m-%d") if row[11] else datetime.datetime.now(),
+            "last_image_gen_date": (
+                datetime.datetime.strptime(row[12], "%Y-%m-%d") if row[12] else None
+            ),
+        }
+    return None
+
+def get_or_create_referral_code(user_id):
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+def get_or_create_referral_code(user_id):
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+def get_or_create_referral_code(user_id):
+    # Создаём пользователя в базе, если его ещё нет!
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
 def update_user_data(user_id, data):
+    username = data.get("username")
+    if username:
+        username = username.lstrip("@").lower()  
     execute_db("""
-        INSERT OR REPLACE INTO users (user_id, tokens, words, premium, premium_plus, expires_at, last_reset, model, referred_by, ref_count, last_message_time, last_active_date, last_image_gen_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO users (
+            user_id, tokens, words, premium, premium_plus,
+            expires_at, last_reset, model, referred_by, ref_count,
+            last_message_time, last_active_date, last_image_gen_date, username
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         data.get("tokens", 0),
@@ -273,7 +387,92 @@ def update_user_data(user_id, data):
         data.get("last_message_time", 0),
         data["last_active_date"].strftime("%Y-%m-%d"),
         data["last_image_gen_date"].strftime("%Y-%m-%d") if data.get("last_image_gen_date") else None,
+        username,
     ), commit=True)
+    
+def get_or_create_referral_code(user_id):
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+def get_or_create_referral_code(user_id):
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+def get_or_create_referral_code(user_id):
+    # Создаём пользователя в базе, если его ещё нет!
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+async def get_chat_id_by_username(username: str, context) -> int | None:
+    try:
+        username = username.replace("@", "")
+        chat = await context.bot.get_chat(username)
+        return chat.id
+    except Exception as e:
+        print(f"Ошибка получения chat_id для @{username}: {e}")
+        return None
+    
+def activate_premium_for_user(user_id: int, days: int = 30):
+    expires_at = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE users
+        SET premium = 1, expires_at = ?
+        WHERE user_id = ?
+    """, (expires_at, user_id))
+    conn.commit()
+    conn.close()
 
 def update_user_subscription(user_id: int, subscription_type: str, context=None):
     now = datetime.datetime.now()
@@ -320,6 +519,34 @@ def get_or_create_referral_code(user_id):
     execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code, joined_at) VALUES (?, ?, date('now'))", (user_id, new_code), commit=True)
     return new_code
 
+def get_or_create_referral_code(user_id):
+    # Создаём пользователя в базе, если его ещё нет!
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
 def set_user_referred_by(user_id, referred_by):
     execute_db("UPDATE users SET referred_by = ? WHERE user_id = ?", (referred_by, user_id), commit=True)
 
@@ -328,6 +555,42 @@ def add_ref_count(user_id, add):
 
 def add_user_tokens(user_id, tokens):
     execute_db("UPDATE users SET tokens = tokens + ? WHERE user_id = ?", (tokens, user_id), commit=True)
+
+def get_or_create_referral_code(user_id):
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
+
+def get_or_create_referral_code(user_id):
+    # Создаём пользователя в базе, если его ещё нет!
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": None,
+            "model": "chatgpt_4_1_nano",
+            "referred_by": None,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,
+            "last_image_gen_date": today,
+        }
+        update_user_data(user_id, user)
+    code = execute_db("SELECT referral_code FROM referrals WHERE user_id = ?", (user_id,), fetchone=True)
+    if code and code[0]:
+        return code[0]
+    new_code = f"ref{user_id}{random.randint(10000, 99999)}"
+    execute_db("INSERT OR REPLACE INTO referrals (user_id, referral_code) VALUES (?, ?)", (user_id, new_code), commit=True)
+    return new_code
 
 def is_admin(user_id):
     return user_id in ADMIN_ID_LIST
@@ -421,21 +684,12 @@ def get_settings_menu():
         [InlineKeyboardButton("🏆 Достижения", callback_data="achievements_menu")], 
         [InlineKeyboardButton("🔙 Назад к профилю", callback_data="back_to_profile")]
     ]
-
 # --- PREMIUM MESSAGE & PAYMENT LOGIC ---
 
 def get_premium_payment_keyboard(payment_method="donationalerts"):
-    # payment_method: "donationalerts" or "cryptobot"
     is_donationalerts = payment_method == "donationalerts"
-    select_buttons = [
-        InlineKeyboardButton(
-            "DonationAlerts" + (" ✅" if is_donationalerts else ""),
-            callback_data="buy_premium_select_donationalerts"
-        ),
-        InlineKeyboardButton(
-            "CryptoBot" + (" ✅" if not is_donationalerts else ""),
-            callback_data="buy_premium_select_cryptobot"
-        )
+    select_buttons = [InlineKeyboardButton("DonationAlerts" + (" ✅" if is_donationalerts else ""),callback_data="buy_premium_select_donationalerts"),
+                      InlineKeyboardButton("CryptoBot" + (" ✅" if not is_donationalerts else ""),callback_data="buy_premium_select_cryptobot")
     ]
     if is_donationalerts:
         premium_url = DONATIONALERTS_PREMIUM_LINK
@@ -445,13 +699,10 @@ def get_premium_payment_keyboard(payment_method="donationalerts"):
         premium_plus_url = CRYPTOBOT_PREMIUM_PLUS_LINK
     buttons = [
         select_buttons,
-        [
-            InlineKeyboardButton("💎 Купить Premium (месяц)", url=premium_url)
-        ],
-        [
-            InlineKeyboardButton("👑 Купить Premium+ (месяц)", url=premium_plus_url)
-        ]
+        [InlineKeyboardButton("💎 Купить Premium (месяц)", callback_data="show_donationalerts_premium" if is_donationalerts else "show_cryptobot_premium")],
+        [InlineKeyboardButton("👑 Купить Premium+ (месяц)", callback_data="show_donationalerts_premium_plus" if is_donationalerts else "show_cryptobot_premium_plus")]
     ]
+
     return InlineKeyboardMarkup(buttons)
 
 def get_premium_message():
@@ -468,18 +719,17 @@ def get_premium_message():
     return text
 
 def get_referrals_info(user_id):
-    # Получаем список рефералов этого пользователя и info о заработке
+    
     ref_info = execute_db(
-        """
-        SELECT u.user_id, u.tokens, r.joined_at
-        FROM users u
-        JOIN referrals r ON u.user_id = r.user_id
-        WHERE u.referred_by = ?
-        ORDER BY r.joined_at DESC
-        """,
-        (user_id,),
-        fetchone=False,
-    )
+    """
+    SELECT user_id, tokens, last_reset
+    FROM users
+    WHERE referred_by = ?
+    ORDER BY last_reset DESC
+    """,
+    (user_id,),
+    fetchone=False,
+)
     total_referrals = len(ref_info)
     user_data = get_user_data(user_id)
     if not user_data:
@@ -552,8 +802,6 @@ ACHIEVEMENTS = [
      lambda u: u["ref_count"] >= 5, 0, lambda u: (min(u["ref_count"], 5), 5)),
     ("ref_10", "Пригласить 10 друзей", "Пригласите 10 друзей",
      lambda u: u["ref_count"] >= 10, 0, lambda u: (min(u["ref_count"], 10), 10)),
-    ("ref_20", "Пригласить 20 друзей", "Пригласите 20 друзей",
-     lambda u: u["ref_count"] >= 20, 0, lambda u: (min(u["ref_count"], 20), 20)),
     ("ref_30", "Пригласить 30 друзей", "Пригласите 30 друзей",
      lambda u: u["ref_count"] >= 30, 0, lambda u: (min(u["ref_count"], 30), 30)),
     ("ref_50", "Пригласить 50 друзей", "Пригласите 50 друзей",
@@ -650,21 +898,24 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    username = update.effective_user.username
     args = context.args
     referred_by = None
-    if args and args[0].startswith("ref"):
-        referred_by_code = args[0]
-        referred = execute_db("SELECT user_id FROM referrals WHERE referral_code = ?", (referred_by_code,), fetchone=True)
-        if referred and referred[0] != user_id:
-            referred_by = referred[0]
-            set_user_referred_by(user_id, referred_by)
-            add_ref_count(referred_by, 1)
-            referrer = get_user_data(referred_by)
-            if referrer:
-                bonus = LIMITS["premium_plus" if referrer.get("premium_plus") else "premium" if referrer.get("premium") else "free"]["ref_bonus"]
-                add_user_tokens(referred_by, bonus)
-    if not get_user_data(user_id):
+
+    user_data = get_user_data(user_id)
+    is_new_user = not user_data
+
+    if is_new_user:
+        if args and args[0].startswith("ref"):
+            referred_by_code = args[0]
+            ref_row = execute_db("SELECT user_id FROM referrals WHERE referral_code = ?", (referred_by_code,), fetchone=True)
+            if ref_row:
+                ref_user_id = ref_row[0]
+                if ref_user_id != user_id:
+                    referred_by = ref_user_id  
         now = datetime.datetime.now()
+        today = now.date()
+
         user = {
             "tokens": LIMITS["free"]["tokens"],
             "words": 0,
@@ -672,28 +923,81 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "premium_plus": False,
             "expires_at": None,
             "last_reset": now,
+            "username": username.lower() if username else None,
             "model": "chatgpt_4_1_nano",
             "referred_by": referred_by,
             "ref_count": 0,
             "last_message_time": 0,
             "last_active_date": now,
-            "last_image_gen_date": None,
+            "last_image_gen_date": today,
         }
+        user["user_id"] = user_id
+        update_user_data(user_id, user)
+
+        if referred_by:
+            add_ref_count(referred_by, 1)
+            referrer = get_user_data(referred_by)
+            if referrer:
+                tier = "premium_plus" if referrer.get("premium_plus") else "premium" if referrer.get("premium") else "free"
+                bonus = LIMITS[tier]["ref_bonus"]
+                add_user_tokens(referred_by, bonus)
+
+                await context.bot.send_message(
+                    referred_by,
+                    f"🎉 Вы успешно пригласили нового пользователя!\n"
+                    f"Вам начислено <b>{bonus}</b> токенов.",
+                    parse_mode="HTML"
+                )
+
+                referrer_bonus = int(bonus * 0.15)
+                add_user_tokens(user_id, referrer_bonus)
+
+                await update.message.reply_text(
+                    f"🎁 За регистрацию по реферальной ссылке вы получили <b>{referrer_bonus}</b> токенов!",
+                    parse_mode="HTML"
+                )
+    else:
+        
+        await update.message.reply_text("👋 Добро пожаловать обратно!")
+
+      
+    if not get_user_data(user_id):
+        now = datetime.datetime.now()
+        today = now.date()  
+        user = {
+            "tokens": LIMITS["free"]["tokens"],
+            "words": 0,
+            "premium": False,
+            "premium_plus": False,
+            "expires_at": None,
+            "last_reset": now,
+            "username": update.effective_user.username,  
+            "model": "chatgpt_4_1_nano",
+            "referred_by": referred_by,
+            "ref_count": 0,
+            "last_message_time": 0,
+            "last_active_date": now,  
+            "last_image_gen_date": today,  
+        }
+        user["user_id"] = user_id
         update_user_data(user_id, user)
     reply_keyboard = [
         ["👤 Профиль", "⚙️Настройки"],
         ["💎 Купить режим"]
     ]
+    
+    
     reply_markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     subscribed = await check_subscription(user_id, context)
     if subscribed:
         await update.message.reply_text(
-            "🌟 Добро пожаловать в умного Telegram-бота!\n\n"
+            "🌟 Добро пожаловать в <b>премиального</b> Telegram-бота!\n\n"
             "Используйте разные модели ИИ для общения и генерации изображений. "
             "Заходите в настройки, чтобы выбрать нужную модель или узнать о бонусах!\n\n"
             "❗️ Для получения большего количества токенов приглашайте друзей или выполняйте задания.\n"
             "Если возникнут вопросы или проблемы — пишите в поддержку: @ggselton 📩",
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            parse_mode="HTML"
         )
     else:
         subscribe_buttons = [
@@ -702,11 +1006,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Проверить подписки", callback_data="check_subscription")]
         ]
         text = (
-            "🎉 Добро пожаловать!\n"
+            "🎉 Добро пожаловать!\n\n"
+            "Используйте разные модели ИИ для общения и генерации изображений.\n"
+            "Заходите в настройки, чтобы выбрать нужную модель или узнать о бонусах!\n"
+            "Для получения большего количества токенов приглашайте друзей или выполняйте задания.\n\n"
             "Чтобы пользоваться ботом, подпишитесь на основные каналы:\n\n"
             f"📢 [Канал №1](https://t.me/{CHANNEL_IDS[0][1:]})\n"
             f"📢 [Канал №2](https://t.me/{CHANNEL_IDS[1][1:]})\n\n"
-            "После подписки нажмите «Проверить подписки» ✅."
+            "После подписки нажмите «Проверить подписки» ✅."  
         )
         await update.message.reply_text(
             text,
@@ -737,12 +1044,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "buy_premium_info":
         text = get_premium_message()
-        kb = get_premium_payment_keyboard(payment_method="donationalerts")
-        await query.message.reply_text(
-            text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        kb = get_premium_payment_keyboard(payment_method=context.user_data.get("payment_method", "donationalerts"))
+        
+        if query.message.text != text:
+            await query.edit_message_text(
+                text,
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+        else:
+            await query.edit_message_reply_markup(reply_markup=kb)
+
 
     elif query.data == "buy_premium_select_donationalerts":
         text = get_premium_message()
@@ -799,34 +1111,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("choose_model_"):
         model_key = query.data[len("choose_model_"):]
+        
         if model_key not in AI_MODELS:
             await query.message.reply_text("❌ Модель не найдена.")
-            return
-        user_data["model"] = model_key
-        update_user_data(user_id, user_data)
-        model = AI_MODELS[model_key]
-        kb = [
-            [
-                InlineKeyboardButton(
-                    f"💎Выбрать ({model['title']})",
-                    callback_data=f"use_model_{model_key}"
-                )
-            ],
-            [
-                InlineKeyboardButton("🔙 Назад", callback_data="choose_text_model_menu" if model["type"] == "text" else "choose_image_model_menu")
-            ]
-        ]
-        await query.edit_message_text(f"🤖 <b>{model['title']}</b>\n\nЦена за 1 запрос: <b>{model['price']} токенов</b>.\nНажмите кнопку ниже для выбора.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            return        
 
-    elif query.data.startswith("use_model_"):
-        model_key = query.data[len("use_model_"):]
-        if model_key not in AI_MODELS:
-            await query.message.reply_text("❌ Модель не найдена.")
+        model = AI_MODELS[model_key]
+
+        if not model.get("api_key"):
+            await query.message.reply_text("⚠️ Эта версия ИИ сейчас недоступна.")
             return
+
         user_data["model"] = model_key
         update_user_data(user_id, user_data)
-        await query.edit_message_text(f"🤖 <b>Модель {AI_MODELS[model_key]['title']}</b> установлена!\nТеперь ваши запросы будут выполняться с помощью этой модели.", parse_mode="HTML")
+
+        await query.edit_message_text(
+            f"🤖 <b>Модель {model['title']}</b> установлена!\nТеперь ваши запросы будут выполняться с помощью этой модели.",
+            parse_mode="HTML"
+        )
         await profile(update, context)
+
+    elif query.data == "buy_premium_info":
+        kb = [
+            [InlineKeyboardButton("💳 DonationAlerts", callback_data="buy_donationalerts")],
+            [InlineKeyboardButton("💰 CryptoBot", callback_data="buy_cryptobot")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")]
+        ]
+        await query.edit_message_text(
+            "💎 <b>Выберите способ оплаты</b>\n\n"
+            "После оплаты отправьте скриншот перевода. Ваша подписка будет активирована в течение часа.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+
+    elif query.data == "buy_donationalerts":
+        context.user_data["payment_method"] = "donationalerts"
+        kb = [
+            [InlineKeyboardButton("➡️ Продолжить к оплате", callback_data="donationalerts_step2")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="buy_premium_info")]
+        ]
+        await query.edit_message_text(
+            "✅ <b>Вы выбрали DonationAlerts</b>\n\n"
+           f"📌 Оплатите <b>{PREMIUM_PLUS_PRICE}</b> и отправьте скриншот сюда.\n"
+            "📦 Premium будет активирован в течение <b>5 - 15 минут</b>.\n"
+            "❗ Не забудьте указать свой username в сообщении к донату.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+
+    elif query.data == "donationalerts_step2":
+        kb = [
+            [InlineKeyboardButton("💳 Оплатить через DonationAlerts", url=DONATIONALERTS_PREMIUM_LINK)],
+            [InlineKeyboardButton("📎 Отправить скриншот", callback_data="resend_screenshot")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="buy_premium_info")]
+        ]
+        await query.edit_message_text(
+            "💳 <b>Ссылка на оплату через DonationAlerts:</b>\n\n"
+            "После оплаты обязательно пришлите скриншот перевода!\n"
+            "Мы вручную активируем Premium в течение <b>5 - 15 минут</b>.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+
+    
+    elif query.data == "resend_screenshot":
+        await query.message.reply_text(
+            "📸 Просто отправьте скриншот подтверждения оплаты сюда, как обычное фото.\n"
+            "Мы обработаем его в течение <b>5 - 15 минут</b> и начислим Premium.",
+            parse_mode="HTML"
+        )
+
+
+    elif query.data == "buy_cryptobot":
+        context.user_data["payment_method"] = "cryptobot"
+        kb = [
+            [InlineKeyboardButton("➡️ Продолжить к оплате", callback_data="cryptobot_step2")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="buy_premium_info")]
+        ]
+        await query.edit_message_text(
+            "✅ <b>Вы выбрали CryptoBot</b>\n\n"
+           f"📌 Оплатите <b>{PREMIUM_PRICE}</b> и отправьте скриншот сюда.\n"
+            "📦 Premium будет активирован в течение <b>5 - 15 минут</b>.\n"
+            "❗ Не забудьте указать свой username при оплате.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+
+    elif query.data == "cryptobot_step2":
+        kb = [
+            [InlineKeyboardButton("💰 Оплатить через CryptoBot", url=CRYPTOBOT_PREMIUM_LINK)],
+            [InlineKeyboardButton("📎 Отправить скриншот", callback_data="resend_screenshot")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="buy_premium_info")]
+        ]
+        await query.edit_message_text(
+            "💰 <b>Ссылка на оплату через CryptoBot:</b>\n\n"
+            "После оплаты отправьте скриншот перевода — мы вручную активируем подписку в течение <b>5 - 15 минут</b>.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+
+    elif query.data == "show_donationalerts_premium":
+        await show_manual_payment_screen(query, context, "donationalerts", "premium")
+
+    elif query.data == "show_donationalerts_premium_plus":
+        await show_manual_payment_screen(query, context, "donationalerts", "premium_plus")
+
+    elif query.data == "show_cryptobot_premium":
+        await show_manual_payment_screen(query, context, "cryptobot", "premium")
+
+    elif query.data == "show_cryptobot_premium_plus":
+        await show_manual_payment_screen(query, context, "cryptobot", "premium_plus")
+
 
     elif query.data == "bonuses_info":
         kb = [
@@ -838,26 +1233,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎁 <b>Бонусы и задания</b>\n\n"
             "• Получайте дополнительные токены за приглашение друзей или выполнение простых заданий — подписки на дополнительные каналы.\n"
             "• Выберите нужный раздел ниже 👇",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
-    elif query.data == "referral_info":
+    if query.data == "referral_info":
         referral_code = get_or_create_referral_code(user_id)
         user_data = get_user_data(user_id)
         ref_bonus = LIMITS["premium_plus" if user_data.get("premium_plus") else "premium" if user_data.get("premium") else "free"]["ref_bonus"]
-        text = (
-            "👥 <b>Пригласите друга!</b>\n\n"
-            "• Поделитесь личной реферальной ссылкой и получите <b>{}</b> токенов за каждого друга!\n"
-            "• Ваш режим: <b>{}</b>\n\n"
-            "Ваша реферальная ссылка:\n"
-            "<code>https://t.me/{botname}?start={ref}</code>\n\n"
-            "<i>Чем больше друзей — тем больше токенов!</i>\n"
-        ).format(ref_bonus, "Premium+" if user_data.get("premium_plus") else ("Premium" if user_data.get("premium") else "Базовый"), botname=context.bot.username, ref=referral_code)
-        kb = [
-            [InlineKeyboardButton("👫 Ваши друзья", callback_data="referral_friends")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")]
-        ]
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        
+        text = ("👥 <b>Пригласите друга!</b>\n"
+                f"• Поделитесь личной реферальной ссылкой и получите <b>{ref_bonus}</b> токенов за каждого друга!\n"
+                f"• Ваш режим: <b>{'Premium+' if user_data.get('premium_plus') else 'Premium' if user_data.get('premium') else 'Базовый'}</b>\n"
+                f"Ваша реферальная ссылка:\n<code>https://t.me/{context.bot.username}?start={referral_code}</code>\n"
+                "<i>Чем больше друзей — тем больше токенов!</i>")
+        
+        kb = [[InlineKeyboardButton("👫 Ваши друзья", callback_data="referral_friends")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="bonuses_info")]]
 
+        if query.message.text != text or query.message.reply_markup != kb:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        else:
+            await query.answer("Ничего не изменилось")
+            
+            
     elif query.data == "referral_friends":
         info_text = get_referrals_info(user_id)
         kb = [[InlineKeyboardButton("🔙 Назад", callback_data="referral_info")]]
@@ -904,6 +1303,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ach_text, percent = get_achievements_menu(user)
             kb = [[InlineKeyboardButton("🔙 Назад", callback_data="settings_menu")]]
             await query.edit_message_text(ach_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_manual_payment_screen(query, context, method: str, tier: str):
+    context.user_data["payment_method"] = method
+    tier_text = "Premium+" if tier == "premium_plus" else "Premium"
+
+    # Цена по методу и уровню
+    if method == "donationalerts":
+        price = DONATIONALERTS_PREMIUM_PLUS_PRICE if tier == "premium_plus" else DONATIONALERTS_PREMIUM_PRICE
+    else:
+        price = CRYPTOBOT_PREMIUM_PLUS_PRICE if tier == "premium_plus" else CRYPTOBOT_PREMIUM_PRICE
+
+    # Ссылка на оплату
+    url = (
+        DONATIONALERTS_PREMIUM_PLUS_LINK if tier == "premium_plus" and method == "donationalerts" else
+        DONATIONALERTS_PREMIUM_LINK if method == "donationalerts" else
+        CRYPTOBOT_PREMIUM_PLUS_LINK if tier == "premium_plus" else
+        CRYPTOBOT_PREMIUM_LINK
+    )
+
+    buttons = [
+        [InlineKeyboardButton("📎 Отправить скрин", callback_data="resend_screenshot")],
+        [InlineKeyboardButton(f"💳 Перейти к оплате ({tier_text})", url=url)],
+        [InlineKeyboardButton("🔙 Назад", callback_data="buy_premium_info")]
+    ]
+
+    await query.edit_message_text(
+        f"💎 <b>Покупка {tier_text}</b> через {'DonationAlerts' if method == 'donationalerts' else 'CryptoBot'}\n\n"
+        f"📌 Оплатите <b>{price}</b> по кнопке ниже\n"
+        "📌 Затем отправьте сюда скриншот подтверждения оплаты\n\n"
+        "⏳ Подписка активируется вручную в течение <b>5 - 15 минут</b>\n"
+        "❗ Не забудьте указать свой username при оплате, если это возможно\n\n"
+        "<i>Если возникнут вопросы, напишите @ggselton</i>",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
 
 async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -990,6 +1424,10 @@ async def ai_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if tokens < price:
         await msg.reply_text(f"❌ Недостаточно токенов! Пополните баланс через приглашения или задания.")
         return
+    
+    if not user_context[user_id] or user_context[user_id][0].get("role") != "system":
+        user_context[user_id].insert(0, {"role": "system", "content": "Всегда отвечай на русском языке. Пользователь русскоязычный."})
+    
     context_history = user_context[user_id]
     context_history.append({"role": "user", "content": msg.text})
     if len(context_history) > 10:
@@ -1075,7 +1513,7 @@ async def add_ad(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
-            "❌ Неверный формат команды. Используйте: /add HH:MM DD.MM.YYYY-DD.MM.YYYY https://t.me/channel/POST_ID"
+            "❌ Неверный формат команды. Используйте: /add HH:MM DD.MM.YYYY-DD.MM.YYYY https://t.me/chаnnel/POST_ID"
         )
         return
     time_to_send = context.args[0]
@@ -1164,7 +1602,13 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     execute_db("INSERT OR REPLACE INTO stat (key, value) VALUES (?, ?)", ("premium", premium), commit=True)
     execute_db("INSERT OR REPLACE INTO stat (key, value) VALUES (?, ?)", ("last_day", last_day), commit=True)
     execute_db("INSERT OR REPLACE INTO stat (key, value) VALUES (?, ?)", ("last_month", last_month), commit=True)
-    await update.message.reply_text(f"Пользователи: {total}/{premium}/{last_day}/{last_month}")
+    await update.message.reply_text(f"<b>Статистика пользователей: </b>\n\n"
+                                    f"<b>Всего: </b><i>{total}</i>\n"
+                                    f"<b>Активных премиум: </b><i>{premium}</i>\n"
+                                    f"<b>За сегодня: </b><i>{last_day}</i>\n"
+                                    f"<b>За месяц: </b><i>{last_month}</i>",
+                                    parse_mode="HTML"
+                                    )
 
 async def send_advertisements(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now()
@@ -1253,16 +1697,161 @@ async def daily_token_reset(context: ContextTypes.DEFAULT_TYPE):
 async def donationalerts_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
 
+async def link_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    if not username:
+        await update.message.reply_text("❗ У вас нет username в Telegram. Задайте его в настройках Telegram.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)", (user_id, username.lower()))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"🔗 Ваш профиль Telegram (@{username}) успешно привязан!")          
+
+async def handle_donation(data, context):
+    try:
+        donation = data["data"][0]
+        message = donation.get("message", "")
+        amount = float(donation.get("amount", 0))
+        username = extract_telegram_username(message)
+
+        if not username:
+            print("❗ Telegram username не найден в сообщении.")
+            return
+
+        user_data = get_user_data_by_username(username)
+        if not user_data:
+            print(f"❌ Пользователь {username} не найден в базе.")
+            return
+
+        user_id = user_data["user_id"]
+
+        if amount >= 499:
+            subscription_type = "premium_plus"
+        elif amount >= 249:
+            subscription_type = "premium"
+        else:
+            subscription_type = None
+
+        if subscription_type:
+            update_user_subscription(user_id, subscription_type, context)
+            await context.bot.send_message(chat_id=user_id, text=f"🎉 Вы получили {subscription_type.replace('_', ' ').capitalize()}! Спасибо за поддержку ❤️")
+            print(f"✅ {username} получил статус {subscription_type}")
+        else:
+            await context.bot.send_message(chat_id=user_id, text="Спасибо за поддержку! ❤️")
+            print(f"💬 Донат без статуса от {username}")
+
+    except Exception as e:
+        print("Ошибка обработки доната:", e)
+    except Exception as e:
+        print("Ошибка обработки доната:", e)
+
+def extract_telegram_username(message_text: str) -> str | None:
+    match = re.search(r'@[\w\d_]{5,}', message_text)
+    return match.group(0) if match else None
+
+async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
+
+    args = context.args
+    if not args or not args[0].startswith("@"):
+        await update.message.reply_text("❗ Использование: /premium @username")
+        return
+
+    username = args[0].lstrip('@').lower()
+    user_data = get_user_data_by_username(username)
+    if not user_data:
+        await update.message.reply_text(f"❌ Пользователь @{username} не найден.")
+        return
+
+    update_user_subscription(user_data["user_id"], "premium", context)
+    await update.message.reply_text(f"✅ Пользователь @{username} получил Premium!")
+    await context.bot.send_message(chat_id=user_data["user_id"], text="🎉 <b>Вам выдан Premium!</b> Спасибо за поддержку ❤️", parse_mode="HTML")
+
+
+async def give_premium_plus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
+
+    args = context.args
+    if not args or not args[0].startswith("@"):
+        await update.message.reply_text("❗ Использование: /premiumplus @username")
+        return
+
+    username = args[0].lstrip('@').lower()
+    user_data = get_user_data_by_username(username)
+    if not user_data:
+        await update.message.reply_text(f"❌ Пользователь @{username} не найден.")
+        return
+
+    update_user_subscription(user_data["user_id"], "premium_plus", context)
+    await update.message.reply_text(f"✅ Пользователь @{username} получил Premium+!")
+    await context.bot.send_message(chat_id=user_data["user_id"], text="🎉 <b>Вам выдан Premium+!</b> Спасибо за поддержку ❤️", parse_mode="HTML")
+async def process_donations(context: ContextTypes.DEFAULT_TYPE):
+
+    
+    while not donation_queue.empty():
+        donation_data = donation_queue.get()
+        telegram_username = donation_data.get("username")
+        chat_id = await get_chat_id_by_username(telegram_username, context)
+        if chat_id:
+            activate_premium_for_user(chat_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🎉 Спасибо за донат! Premium активирован на 30 дней!"
+            )
+
+async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "Без username"
+    payment_method = context.user_data.get("payment_method", "не указан")
+
+    for admin_id in ADMIN_ID_LIST:
+        try:
+            await context.bot.send_message(admin_id,
+                f"📥 <b>Новый платёж на проверку</b>\n"
+                f"👤 <b>User:</b> @{username} | ID: <code>{user_id}</code>\n"
+                f"💳 Способ: <b>{payment_method}</b>\n\n"
+                f"📸 Скриншот ниже ⬇️",
+                parse_mode="HTML"
+            )
+            await context.bot.send_photo(admin_id, photo=update.message.photo[-1].file_id)
+        except Exception as e:
+            logging.error(f"Ошибка пересылки админам: {e}")
+
+    await update.message.reply_text(
+        "✅ Спасибо! Мы получили скриншот.\n"
+        "⏳ Ожидайте активации Premium — обычно это занимает до <b>5 - 15 минут</b>.\n"
+        "Если возникнут вопросы — напишите @ggselton 💬",
+        parse_mode="HTML"
+    )
+
 def main():
     init_db()
     migrate_db()
     give_premium_to_admins()
+    print("Пользователи в базе:", execute_db("SELECT user_id, username FROM users", fetchone=False))
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("premium", give_premium))
+    application.add_handler(CommandHandler("premiumplus", give_premium_plus))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("link", link_user))
     application.add_handler(CommandHandler("add", add_ad))
     application.add_handler(CommandHandler("addstat", addstat))
     application.add_handler(CommandHandler("adddelete", adddelete))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_payment_proof))
     application.add_handler(CommandHandler("stat", stat))
     application.add_handler(CommandHandler("adc", adc))
     application.add_handler(CommandHandler("adcdelete", adcdelete))
@@ -1270,11 +1859,13 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(r"^👤 Профиль$") | filters.Regex(r"^⚙️Настройки$") | filters.Regex(r"^💎 Купить режим$"), keyboard_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), ai_message_handler))
     application.add_error_handler(error_handler)
-    job_queue = application.job_queue
-    job_queue.run_repeating(send_advertisements, interval=60, first=0)
-    job_queue.run_repeating(daily_token_reset, interval=60*60*24, first=0)
+
+    application.job_queue.run_repeating(send_advertisements, interval=60, first=0)
+    application.job_queue.run_repeating(daily_token_reset, interval=60*60*24, first=0)
+    application.job_queue.run_repeating(process_donations, interval=5, first=0)
+
     print("✳️Бот запущен...")
     application.run_polling()
-
+    
 if __name__ == "__main__":
     main()
