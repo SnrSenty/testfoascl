@@ -519,9 +519,9 @@ async def process_donations(context: ContextTypes.DEFAULT_TYPE):
                 continue
             
             chat_id = user_data["user_id"]
-            activate_premium_for_user(chat_id)
+            await update_user_subscription(chat_id, "premium", context)
             print(f"✅ Premium активирован для {telegram_username}")
-        
+                    
         except asyncio.QueueEmpty:
             break
         except Exception as e:
@@ -538,18 +538,6 @@ async def get_chat_id_by_username(username: str, context) -> int | None:
         print(f"Ошибка получения chat_id для @{username}: {e}")
         return None
     
-def activate_premium_for_user(user_id: int, days: int = 30):
-    expires_at = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE users
-        SET premium = 1, expires_at = ?
-        WHERE user_id = ?
-    """, (expires_at, user_id))
-    conn.commit()
-    conn.close()
-
 def activate_premium_for_user(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -1894,9 +1882,9 @@ async def process_donations(context: ContextTypes.DEFAULT_TYPE):
                 continue
             
             chat_id = user_data["user_id"]
-            activate_premium_for_user(chat_id)
+            await update_user_subscription(chat_id, "premium", context)
             print(f"✅ Premium активирован для {telegram_username}")
-        
+                    
         except asyncio.QueueEmpty:
             break
         except Exception as e:
